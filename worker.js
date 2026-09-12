@@ -1,6 +1,6 @@
 // ================================================================
 // DAIMONIUM BACKEND - Cloudflare Worker (Full Integrated)
-// نسخه V2.2 - افزودن لاگ‌های تشخیصی
+// نسخه V2.3 - رفع باگ Rate Limit (per-path keys)
 // ================================================================
 
 // ================================================================
@@ -465,17 +465,24 @@ export default {
         // ============================================================
         // RATE LIMITING (به جز webhook)
         // ============================================================
+        // ✅ نسخه V2.3: کلید Rate Limit حالا شامل path است تا هر endpoint
+        //    شمارنده‌ی مستقل داشته باشد. همچنین محدودیت /auth از 20 به 60
+        //    افزایش یافت تا باز کردن‌های مکرر مینی‌اپ مشکلی ایجاد نکند.
+        // ============================================================
         if (path !== '/webhook') {
             const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
-            const limitKey = `ip:${clientIp}`;
+            // ✅ کلید بر اساس IP + مسیر (per-path)
+            const limitKey = `ip:${clientIp}:${path}`;
             let limit = 100;
-            if (path === '/auth') limit = 20;
+            if (path === '/auth') limit = 60;                                    // ← افزایش از 20 به 60
             else if (path.startsWith('/payments/')) limit = 30;
             else if (path.startsWith('/tasks/')) limit = 50;
             else if (path.startsWith('/referral/')) limit = 30;
             else if (path === '/user/verify') limit = 100;
+
             const allowed = await checkRateLimit(kv, limitKey, limit, 60);
             if (!allowed) {
+                console.warn(`Rate limit exceeded: IP=${clientIp}, path=${path}, limit=${limit}/60s`);
                 return errorResponse('RATE_LIMITED', 'Too many requests', 429);
             }
         }
