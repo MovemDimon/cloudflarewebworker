@@ -1,21 +1,3 @@
-name = "cloudflarewebworker"
+name = "my-worker"
 main = "worker.js"
-account_id = "a16064d411694e2339281bdf4093b2d0"
-workers_dev = true
-compatibility_date = "2025-06-04"
-
-[build]
-format = "modules"
-
-[[durable_objects.bindings]]
-name = "BOTNAMESPACE"
-class_name = "BotNamespace"
-
-[[durable_objects.bindings]]
-name = "WSNAMESPACE"
-class_name = "WSNamespace"
-
-# اضافه کردن migration برای ساخت DO ها
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["BotNamespace", "WSNamespace"]
+compatibility_date = "2026-10-01"
