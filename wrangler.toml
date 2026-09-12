@@ -1,3 +1,18 @@
 name = "api"
 main = "worker.js"
-compatibility_date = "2026-10-01"
+compatibility_date = "2026-09-12"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+
+[[kv_namespaces]]
+binding = "KV"
+id = "9c2eb2cb00bc4216abfda1689d57dfba"
+
+[[d1_databases]]
+binding = "DB"
+database_id = "379419bc-61ab-4fd6-95a8-3fb80b98fe45"
