@@ -1,6 +1,6 @@
 // ================================================================
 // DAIMONIUM BACKEND - Cloudflare Worker (Full Integrated)
-// نسخه V2.3 - رفع باگ Rate Limit (per-path keys)
+// نسخه V2.4 - افزودن Test Mode
 // ================================================================
 
 // ================================================================
@@ -463,18 +463,172 @@ export default {
         }
 
         // ============================================================
-        // RATE LIMITING (به جز webhook)
+        // ============ TEST MODE START ===============================
         // ============================================================
-        // ✅ نسخه V2.3: کلید Rate Limit حالا شامل path است تا هر endpoint
-        //    شمارنده‌ی مستقل داشته باشد. همچنین محدودیت /auth از 20 به 60
-        //    افزایش یافت تا باز کردن‌های مکرر مینی‌اپ مشکلی ایجاد نکند.
+        // ⚠️ هشدار امنیتی: این endpoint‌ها فقط برای تست هستند و
+        //    باید قبل از انتشار عمومی حذف شوند!
+        //    برای حذف، کل بلوک بین TEST MODE START و TEST MODE END را پاک کنید.
         // ============================================================
-        if (path !== '/webhook') {
+
+        // ------------------------------------------------------------
+        // TEST: شبیه‌سازی پرداخت موفق (بدون تأیید واقعی)
+        // ------------------------------------------------------------
+        if (path === '/test/simulate-payment' && method === 'POST') {
+            try {
+                console.log('[TEST MODE] simulate-payment called');
+                const body = await request.json();
+                const { telegramId, packageId, type } = body;
+
+                if (!telegramId || !packageId) {
+                    return errorResponse('INVALID_REQUEST', 'Missing telegramId or packageId', 400);
+                }
+
+                // پیدا کردن بسته
+                const packages = await db.prepare('SELECT value FROM config WHERE key = ?').bind('package_prices').first();
+                const packageData = packages ? JSON.parse(packages.value) : PACKAGE_DEFINITIONS;
+                const pkg = packageData[packageId];
+
+                if (!pkg) {
+                    return errorResponse('INVALID_PACKAGE', 'Invalid package: ' + packageId, 400);
+                }
+
+                // بررسی اینکه کاربر وجود دارد
+                const user = await db.prepare('SELECT * FROM users WHERE telegram_id = ?').bind(telegramId).first();
+                if (!user) {
+                    return errorResponse('USER_NOT_FOUND', 'User not found in database. Please authenticate first.', 404);
+                }
+
+                // درج رکورد پرداخت فرضی
+                const txHash = 'test_' + Date.now() + '_' + Math.random().toString(36).substring(7);
+                const paymentType = type || 'ton';
+
+                await db.prepare(
+                    'INSERT INTO payments (telegram_id, type, package_id, amount, coins, tx_hash, status) VALUES (?, ?, ?, ?, ?, ?, ?)'
+                ).bind(telegramId, paymentType, packageId, pkg.usdt, pkg.coins, txHash, 'paid').run();
+
+                // افزایش موجودی
+                const newBalance = await db.prepare(
+                    'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ? RETURNING balance'
+                ).bind(pkg.coins, telegramId).first();
+
+                // درج رویداد برای analytics
+                await db.prepare(
+                    'INSERT INTO events (telegram_id, event_type, data) VALUES (?, ?, ?)'
+                ).bind(telegramId, 'test_payment_simulated', JSON.stringify({ packageId, type: paymentType, coins: pkg.coins })).run();
+
+                console.log('[TEST MODE] Payment simulated:', { telegramId, packageId, coins: pkg.coins, newBalance: newBalance?.balance });
+
+                return jsonResponse({
+                    success: true,
+                    message: 'Payment simulated successfully',
+                    packageId: packageId,
+                    type: paymentType,
+                    coins: pkg.coins,
+                    balance: newBalance?.balance || 0,
+                    txHash: txHash,
+                });
+            } catch (e) {
+                console.error('[TEST MODE] simulate-payment error:', e);
+                return errorResponse('SERVER_ERROR', e.message, 500);
+            }
+        }
+
+        // ------------------------------------------------------------
+        // TEST: شبیه‌سازی Webhook Stars
+        // ------------------------------------------------------------
+        if (path === '/test/simulate-stars-webhook' && method === 'POST') {
+            try {
+                console.log('[TEST MODE] simulate-stars-webhook called');
+                const body = await request.json();
+                const { invoicePayload, telegramId } = body;
+
+                if (!invoicePayload || !telegramId) {
+                    return errorResponse('INVALID_REQUEST', 'Missing invoicePayload or telegramId', 400);
+                }
+
+                // شبیه‌سازی همان کدی که در Webhook واقعی اجرا می‌شود
+                const result = await db.prepare(
+                    'UPDATE payments SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE invoice_id = ? AND telegram_id = ?'
+                ).bind('paid', invoicePayload, telegramId).run();
+
+                if (result.changes > 0) {
+                    const payRecord = await db.prepare(
+                        'SELECT * FROM payments WHERE invoice_id = ? AND telegram_id = ?'
+                    ).bind(invoicePayload, telegramId).first();
+
+                    if (payRecord) {
+                        const newBalance = await db.prepare(
+                            'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ? RETURNING balance'
+                        ).bind(payRecord.coins, telegramId).first();
+
+                        console.log('[TEST MODE] Webhook simulated:', { invoicePayload, coins: payRecord.coins, newBalance: newBalance?.balance });
+
+                        return jsonResponse({
+                            success: true,
+                            message: 'Webhook simulated successfully',
+                            coins: payRecord.coins,
+                            balance: newBalance?.balance || 0,
+                        });
+                    }
+                }
+
+                return errorResponse('PAYMENT_NOT_FOUND', 'Payment record not found for this invoicePayload', 404);
+            } catch (e) {
+                console.error('[TEST MODE] simulate-stars-webhook error:', e);
+                return errorResponse('SERVER_ERROR', e.message, 500);
+            }
+        }
+
+        // ------------------------------------------------------------
+        // TEST: دریافت اطلاعات کاربر (برای دیباگ)
+        // ------------------------------------------------------------
+        if (path === '/test/user-info' && method === 'POST') {
+            try {
+                const body = await request.json();
+                const { telegramId } = body;
+
+                if (!telegramId) {
+                    return errorResponse('INVALID_REQUEST', 'Missing telegramId', 400);
+                }
+
+                const user = await db.prepare('SELECT * FROM users WHERE telegram_id = ?').bind(telegramId).first();
+                if (!user) {
+                    return errorResponse('USER_NOT_FOUND', 'User not found', 404);
+                }
+
+                const payments = await db.prepare(
+                    'SELECT * FROM payments WHERE telegram_id = ? ORDER BY created_at DESC LIMIT 10'
+                ).bind(telegramId).all();
+
+                return jsonResponse({
+                    success: true,
+                    user: {
+                        telegramId: user.telegram_id,
+                        firstName: user.first_name,
+                        username: user.username,
+                        balance: user.balance,
+                        referrals: user.referrals_count,
+                    },
+                    recentPayments: payments.results || [],
+                });
+            } catch (e) {
+                console.error('[TEST MODE] user-info error:', e);
+                return errorResponse('SERVER_ERROR', e.message, 500);
+            }
+        }
+
+        // ============================================================
+        // ============ TEST MODE END =================================
+        // ============================================================
+
+        // ============================================================
+        // RATE LIMITING (به جز webhook و test endpoints)
+        // ============================================================
+        if (path !== '/webhook' && !path.startsWith('/test/')) {
             const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
-            // ✅ کلید بر اساس IP + مسیر (per-path)
             const limitKey = `ip:${clientIp}:${path}`;
             let limit = 100;
-            if (path === '/auth') limit = 60;                                    // ← افزایش از 20 به 60
+            if (path === '/auth') limit = 60;
             else if (path.startsWith('/payments/')) limit = 30;
             else if (path.startsWith('/tasks/')) limit = 50;
             else if (path.startsWith('/referral/')) limit = 30;
@@ -623,7 +777,7 @@ export default {
         // ============================================================
         let telegramId = null;
 
-        if (path !== '/auth' && path !== '/config' && path !== '/webhook' && path !== '/setwebhook' && path !== '/health' && path !== '/') {
+        if (path !== '/auth' && path !== '/config' && path !== '/webhook' && path !== '/setwebhook' && path !== '/health' && path !== '/' && !path.startsWith('/test/')) {
             telegramId = await getUserFromJWT(request, config.JWT_SECRET);
             if (!telegramId) {
                 return errorResponse('AUTH_FAILED', 'Invalid or missing token', 401);
