@@ -1,8 +1,0 @@
-{
-  "name": "daimonium-worker",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "deploy": "wrangler d1 migrations apply dimon-db --remote && wrangler deploy"
-  }
-}
