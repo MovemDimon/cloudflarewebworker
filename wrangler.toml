@@ -15,6 +15,4 @@ id = "9c2eb2cb00bc4216abfda1689d57dfba"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "dimon-db"
 database_id = "379419bc-61ab-4fd6-95a8-3fb80b98fe45"
-migrations_dir = "migrations"
