@@ -1,15 +1,17 @@
 // ================================================================
-// DAIMONIUM BACKEND - Cloudflare Worker (Full Integrated)
-// نسخه V2.4 - افزودن Test Mode
+// DAIMONIUM BACKEND — Cloudflare Worker
+// نسخه V9.2 — Security + Bootstrap/Sync + Jetton Proxy + Double-Reward Fix
+// ================================================================
+// تغییرات نسبت به V9.1:
+//   • 🔴 رفع باگ double-reward در /sync (چک already + dedupe)
+//   • 🟡 کاهش rate limit /ton/jetton-wallet به 30/min
+//   • 🟡 INSERT OR IGNORE برای safety بیشتر
 // ================================================================
 
-// ================================================================
-// CONSTANTS
-// ================================================================
 const CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Telegram-Init-Data',
     'Access-Control-Max-Age': '86400',
 };
 
@@ -27,7 +29,17 @@ const TASK_REWARDS = {
     ad_watch: 150,
 };
 
-const CONFIG_CACHE_TTL = 7 * 24 * 60 * 60;
+const REFERRAL_REWARDS = {
+    invite3: { required: 3, reward: 5000 },
+    invite5: { required: 5, reward: 10000 },
+    invite10: { required: 10, reward: 30000 },
+    invite20: { required: 20, reward: 100000 },
+};
+
+const USDT_MASTER = 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2E_sFs';
+const USDT_DECIMALS = 6;
+const CONFIG_CACHE_TTL = 7 * 24 * 60 * 60;  // seconds
+const JWT_EXPIRES = 30 * 24 * 60 * 60;      // 30 روز
 
 // ================================================================
 // HELPERS
@@ -35,11 +47,7 @@ const CONFIG_CACHE_TTL = 7 * 24 * 60 * 60;
 function jsonResponse(data, status = 200, headers = {}) {
     return new Response(JSON.stringify(data), {
         status,
-        headers: {
-            'Content-Type': 'application/json',
-            ...CORS_HEADERS,
-            ...headers,
-        }
+        headers: { 'Content-Type': 'application/json', ...CORS_HEADERS, ...headers }
     });
 }
 
@@ -47,9 +55,24 @@ function errorResponse(code, message, status = 400) {
     return jsonResponse({ code, message }, status);
 }
 
-// ================================================================
-// VALIDATION
-// ================================================================
+// ✅ hash آدرس TON برای مقایسه امن
+function tonAddressHash(addr) {
+    if (!addr || typeof addr !== 'string') return '';
+    if (addr.includes(':')) return addr.split(':')[1].toLowerCase();
+    try {
+        const clean = addr.replace(/-/g, '+').replace(/_/g, '/');
+        const buf = atob(clean);
+        if (buf.length !== 36) return addr.toLowerCase();
+        let hex = '';
+        for (let i = 2; i < 34; i++) {
+            hex += buf.charCodeAt(i).toString(16).padStart(2, '0');
+        }
+        return hex;
+    } catch (e) {
+        return addr.toLowerCase();
+    }
+}
+
 function isValidTonAddress(address) {
     if (typeof address !== 'string') return false;
     if (address.length < 48 || address.length > 52) return false;
@@ -59,13 +82,11 @@ function isValidTonAddress(address) {
 }
 
 // ================================================================
-// JWT (با Web Crypto API)
+// JWT
 // ================================================================
 function base64UrlEncode(data) {
     return btoa(JSON.stringify(data))
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=+$/, '');
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function base64UrlDecode(str) {
@@ -74,53 +95,41 @@ function base64UrlDecode(str) {
     return JSON.parse(atob(str));
 }
 
-async function generateJWT(payload, secret, expiresIn = 604800) {
+async function generateJWT(payload, secret, expiresIn = JWT_EXPIRES) {
     const header = { alg: 'HS256', typ: 'JWT' };
     const now = Math.floor(Date.now() / 1000);
-    const exp = now + expiresIn;
-    const data = { ...payload, iat: now, exp };
+    const data = { ...payload, iat: now, exp: now + expiresIn };
     const encodedHeader = base64UrlEncode(header);
     const encodedPayload = base64UrlEncode(data);
     const key = await crypto.subtle.importKey(
-        'raw',
-        new TextEncoder().encode(secret),
-        { name: 'HMAC', hash: 'SHA-256' },
-        false,
-        ['sign']
+        'raw', new TextEncoder().encode(secret),
+        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
     );
     const signature = await crypto.subtle.sign(
-        'HMAC',
-        key,
-        new TextEncoder().encode(encodedHeader + '.' + encodedPayload)
+        'HMAC', key, new TextEncoder().encode(encodedHeader + '.' + encodedPayload)
     );
     const encodedSignature = btoa(String.fromCharCode(...new Uint8Array(signature)))
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=+$/, '');
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     return encodedHeader + '.' + encodedPayload + '.' + encodedSignature;
 }
 
 async function verifyJWT(token, secret) {
     try {
         const parts = token.split('.');
-        if (parts.length !== 3) throw new Error('Invalid token format');
+        if (parts.length !== 3) throw new Error('Invalid format');
         const [header, payload, signature] = parts;
         const key = await crypto.subtle.importKey(
-            'raw',
-            new TextEncoder().encode(secret),
-            { name: 'HMAC', hash: 'SHA-256' },
-            false,
-            ['verify']
+            'raw', new TextEncoder().encode(secret),
+            { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']
         );
-        const expected = await crypto.subtle.verify(
-            'HMAC',
-            key,
+        const valid = await crypto.subtle.verify(
+            'HMAC', key,
             Uint8Array.from(atob(signature.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)),
             new TextEncoder().encode(header + '.' + payload)
         );
-        if (!expected) throw new Error('Invalid signature');
+        if (!valid) throw new Error('Invalid signature');
         const data = base64UrlDecode(payload);
-        if (data.exp < Math.floor(Date.now() / 1000)) throw new Error('Token expired');
+        if (data.exp < Math.floor(Date.now() / 1000)) throw new Error('Expired');
         return data;
     } catch (e) {
         throw new Error('Invalid token: ' + e.message);
@@ -128,7 +137,7 @@ async function verifyJWT(token, secret) {
 }
 
 // ================================================================
-// TELEGRAM initData VERIFICATION
+// TELEGRAM INITDATA VERIFICATION
 // ================================================================
 async function verifyTelegramInitData(initData, botToken) {
     try {
@@ -139,26 +148,24 @@ async function verifyTelegramInitData(initData, botToken) {
         const sortedKeys = Array.from(params.keys()).sort();
         const dataCheckString = sortedKeys.map(k => k + '=' + params.get(k)).join('\n');
         const secretKey = await crypto.subtle.importKey(
-            'raw',
-            new TextEncoder().encode('WebAppData'),
-            { name: 'HMAC', hash: 'SHA-256' },
-            false,
-            ['sign']
+            'raw', new TextEncoder().encode('WebAppData'),
+            { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
         );
         const secret = await crypto.subtle.sign('HMAC', secretKey, new TextEncoder().encode(botToken));
         const signatureKey = await crypto.subtle.importKey(
-            'raw',
-            secret,
-            { name: 'HMAC', hash: 'SHA-256' },
-            false,
-            ['sign']
+            'raw', secret,
+            { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
         );
-        const calculatedHash = await crypto.subtle.sign('HMAC', signatureKey, new TextEncoder().encode(dataCheckString));
-        const calculatedHex = Array.from(new Uint8Array(calculatedHash)).map(b => b.toString(16).padStart(2, '0')).join('');
+        const calculatedHash = await crypto.subtle.sign(
+            'HMAC', signatureKey, new TextEncoder().encode(dataCheckString)
+        );
+        const calculatedHex = Array.from(new Uint8Array(calculatedHash))
+            .map(b => b.toString(16).padStart(2, '0')).join('');
         if (calculatedHex !== hash) return null;
         const userStr = params.get('user');
         if (!userStr) return null;
-        return JSON.parse(decodeURIComponent(userStr));
+        // ✅ URLSearchParams خودش decode می‌کنه
+        return JSON.parse(userStr);
     } catch (e) {
         console.error('Telegram verification error:', e);
         return null;
@@ -166,41 +173,42 @@ async function verifyTelegramInitData(initData, botToken) {
 }
 
 // ================================================================
-// TON VERIFICATION
+// TON JETTON TRANSFER VERIFICATION (via tonapi.io)
 // ================================================================
-async function verifyTonTransaction(boc, expectedAmount, expectedRecipient, tonApiKey) {
+async function findMatchingJettonTransfer(senderWallet, expectedAmountUsdt, ourAddress, apiKey) {
     try {
-        const response = await fetch(
-            'https://toncenter.com/api/v2/decrypt?boc=' + encodeURIComponent(boc),
-            {
-                headers: tonApiKey ? { 'X-API-Key': tonApiKey } : {}
+        const url = 'https://tonapi.io/v2/accounts/' + encodeURIComponent(senderWallet) + '/events?limit=20';
+        const res = await fetch(url, {
+            headers: apiKey ? { 'Authorization': 'Bearer ' + apiKey } : {}
+        });
+        if (!res.ok) return { error: 'TON API returned ' + res.status };
+        const data = await res.json();
+
+        const expectedRawAmount = Math.round(expectedAmountUsdt * Math.pow(10, USDT_DECIMALS));
+        const ourHash = tonAddressHash(ourAddress);
+        const usdtHash = tonAddressHash(USDT_MASTER);
+        const now = Math.floor(Date.now() / 1000);
+
+        for (const ev of data.events || []) {
+            if (ev.timestamp && (now - ev.timestamp) > 600) continue;
+            for (const act of ev.actions || []) {
+                if (act.type !== 'JettonTransfer') continue;
+                const jt = act.JettonTransfer;
+                if (!jt) continue;
+                if (tonAddressHash(jt.jetton && jt.jetton.address) !== usdtHash) continue;
+                if (tonAddressHash(jt.recipient && jt.recipient.address) !== ourHash) continue;
+                if (parseInt(jt.amount, 10) !== expectedRawAmount) continue;
+                return {
+                    txHash: ev.event_id || ev.lt,
+                    sender: (jt.sender && jt.sender.address) || senderWallet,
+                    amount: expectedAmountUsdt,
+                    rawAmount: expectedRawAmount
+                };
             }
-        );
-        if (!response.ok) throw new Error('TON API error: ' + response.status);
-        const data = await response.json();
-        if (!data.ok) throw new Error('Invalid BOC: ' + (data.error || 'unknown'));
-
-        const tx = data.result;
-        const sender = tx.source || tx.in_msg?.source || null;
-        const recipient = tx.destination || tx.in_msg?.destination || null;
-        const amount = tx.value || tx.in_msg?.value || 0;
-        const txHash = tx.transaction_id?.hash || tx.hash || null;
-
-        if (!sender || !recipient || !txHash) {
-            return { valid: false, error: 'Missing transaction data' };
         }
-        if (recipient.toLowerCase() !== expectedRecipient.toLowerCase()) {
-            return { valid: false, error: 'Recipient mismatch' };
-        }
-        const amountTon = parseFloat(amount) / 1e9;
-        if (Math.abs(amountTon - expectedAmount) > 0.0001) {
-            return { valid: false, error: 'Amount mismatch' };
-        }
-
-        return { valid: true, sender, recipient, amount: amountTon, txHash };
+        return null;
     } catch (e) {
-        console.error('TON verification error:', e);
-        return { valid: false, error: e.message };
+        return { error: e.message };
     }
 }
 
@@ -210,27 +218,23 @@ async function verifyTonTransaction(boc, expectedAmount, expectedRecipient, tonA
 async function checkRateLimit(kv, key, limit, windowSeconds) {
     const now = Math.floor(Date.now() / 1000);
     const windowKey = Math.floor(now / windowSeconds);
-    const kvKey = `ratelimit:${key}:${windowKey}`;
+    const kvKey = 'ratelimit:' + key + ':' + windowKey;
     const current = await kv.get(kvKey, 'json');
     if (current === null) {
         await kv.put(kvKey, JSON.stringify({ count: 1 }), { expirationTtl: windowSeconds + 10 });
         return true;
     }
-    if (current.count >= limit) {
-        return false;
-    }
+    if (current.count >= limit) return false;
     await kv.put(kvKey, JSON.stringify({ count: current.count + 1 }), { expirationTtl: windowSeconds + 10 });
     return true;
 }
 
 // ================================================================
-// MIDDLEWARE: دریافت کاربر از JWT
+// AUTH HELPER
 // ================================================================
 async function getUserFromJWT(request, secret) {
     const authHeader = request.headers.get('Authorization');
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return null;
-    }
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
     try {
         const token = authHeader.substring(7);
         const payload = await verifyJWT(token, secret);
@@ -241,96 +245,65 @@ async function getUserFromJWT(request, secret) {
 }
 
 // ================================================================
-// BOT FUNCTIONS
+// CONFIG LOADER (with Cache API)
 // ================================================================
-async function sendWelcomeMessage(chatId, firstName, botToken) {
-    console.log('========== SEND MESSAGE ==========');
-    console.log('chatId type:', typeof chatId);
-    console.log('chatId value:', chatId);
-    console.log('firstName:', firstName);
-    console.log('token exists:', !!botToken);
-    console.log('token length:', botToken ? botToken.length : 0);
+async function loadConfig(kv, db, cache, ctx) {
+    const CACHE_KEY = 'https://daimonium.internal/config-v9';
+    const cached = await cache.match(CACHE_KEY);
+    if (cached) {
+        try { return await cached.json(); } catch (e) {}
+    }
 
-    const message = `Hey ${firstName}! 👋
-Welcome to Daimonium — your gateway to the future of crypto!
+    const [featuresRow, packagesRow] = await Promise.all([
+        db.prepare('SELECT value FROM config WHERE key = ?').bind('features').first(),
+        db.prepare('SELECT value FROM config WHERE key = ?').bind('package_prices').first(),
+    ]);
 
-💠 For the first time ever on Telegram, you can buy Daimonium tokens at the base price before listing, or collect them completely free along the way!
-
-🚀 Why is Daimonium unique?
-✅ Early access: Buy & invest before listing (no other mini app allows this!)
-✅ Integrated with the Future Finance App Project. Your tokens will have real utility
-✅ Target market cap: $1B+`;
-
-    console.log('Message length:', message.length);
-    console.log('Message preview:', message.substring(0, 200));
-
-    const keyboard = {
-        inline_keyboard: [
-            [
-                { text: '🚀 Stars earn more', url: 'https://t.me/Daimonium_bot/Daimonium' }
-            ]
-        ]
+    const features = featuresRow ? JSON.parse(featuresRow.value) : {
+        stars: true, ton: true, referral: true, tasks: true, walletConnect: true, ads: false
     };
+    features.ads = false;
 
-    const payload = {
-        chat_id: chatId,
-        text: message,
-        reply_markup: keyboard,
-        parse_mode: 'HTML'
-    };
+    const packages = packagesRow ? JSON.parse(packagesRow.value) : PACKAGE_DEFINITIONS;
+    const data = { features, packages };
 
-    let body;
-    try {
-        body = JSON.stringify(payload);
-        console.log('Payload size:', body.length);
-        console.log('Payload:', body);
-    } catch (err) {
-        console.error('JSON stringify failed:', err);
-        throw err;
-    }
-
-    const telegramUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
-    console.log('Sending request to Telegram');
-
-    let response;
-    try {
-        response = await fetch(telegramUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body
-        });
-        console.log('Fetch completed');
-    } catch (fetchError) {
-        console.error('Fetch failed:', fetchError);
-        throw fetchError;
-    }
-
-    console.log('Status:', response.status);
-    console.log('StatusText:', response.statusText);
-
-    const rawBody = await response.text();
-    console.log('Telegram response:', rawBody);
-
-    let telegramResult;
-    try {
-        telegramResult = JSON.parse(rawBody);
-    } catch {
-        throw new Error('Telegram returned invalid JSON');
-    }
-
-    console.log('Telegram OK:', telegramResult.ok);
-
-    if (!telegramResult.ok) {
-        console.error('Telegram Error:', telegramResult);
-        throw new Error(telegramResult.description || 'Unknown Telegram Error');
-    }
-
-    console.log('Message sent successfully');
-    return response;
+    const resp = new Response(JSON.stringify(data), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=86400' }
+    });
+    ctx.waitUntil(cache.put(CACHE_KEY, resp.clone()));
+    return data;
 }
 
 // ================================================================
-// HANDLER PRINCIPAL
+// WELCOME MESSAGE
+// ================================================================
+async function sendWelcomeMessage(chatId, firstName, botToken) {
+    const message = 'Hey ' + firstName + '! 👋\n' +
+        'Welcome to Daimonium — your gateway to the future of crypto!\n\n' +
+        '💠 For the first time ever on Telegram, you can buy Daimonium tokens at the base price before listing, or collect them completely free along the way!\n\n' +
+        '🚀 Why is Daimonium unique?\n' +
+        '✅ Early access: Buy & invest before listing\n' +
+        '✅ Integrated with the Future Finance App Project\n' +
+        '✅ Target market cap: $1B+';
+
+    const keyboard = {
+        inline_keyboard: [[
+            { text: '🚀 Stars earn more', url: 'https://t.me/Daimonium_bot/Daimonium' }
+        ]]
+    };
+
+    const res = await fetch('https://api.telegram.org/bot' + botToken + '/sendMessage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: message, reply_markup: keyboard, parse_mode: 'HTML' })
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.description || 'Telegram error');
+    return data;
+}
+
+// ================================================================
+// MAIN HANDLER
 // ================================================================
 export default {
     async fetch(request, env, ctx) {
@@ -338,165 +311,266 @@ export default {
         const path = url.pathname;
         const method = request.method;
 
-        // CORS
-        if (method === 'OPTIONS') {
-            return new Response(null, { headers: CORS_HEADERS });
-        }
+        if (method === 'OPTIONS') return new Response(null, { headers: CORS_HEADERS });
 
-        // Load config from env
         const config = {
             TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN,
             TON_API_KEY: env.TON_API_KEY || '',
             JWT_SECRET: env.JWT_SECRET,
-            TON_RECIPIENT_FALLBACK: env.TON_RECIPIENT || null,
-            USDT_JETTON_ADDRESS: env.USDT_JETTON_ADDRESS || 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2E_sFs',
+            ADMIN_TOKEN: env.ADMIN_TOKEN || '',
+            WEBHOOK_SECRET: env.WEBHOOK_SECRET || '',
+            TON_RECIPIENT: env.TON_RECIPIENT || 'UQD-_u6BRI63PvjYQEt9sa0j3lwlCO7DHMkKrH0o9azDL3xP',
+            USDT_JETTON_ADDRESS: env.USDT_JETTON_ADDRESS || USDT_MASTER,
         };
 
-        if (!config.JWT_SECRET) {
-            console.error('JWT_SECRET not set');
-            return errorResponse('SERVER_ERROR', 'JWT secret not configured', 500);
-        }
-        if (!config.TELEGRAM_BOT_TOKEN) {
-            console.error('TELEGRAM_BOT_TOKEN not set');
-            return errorResponse('SERVER_ERROR', 'Telegram bot token not configured', 500);
-        }
+        if (!config.JWT_SECRET) return errorResponse('SERVER_ERROR', 'JWT secret not configured', 500);
+        if (!config.TELEGRAM_BOT_TOKEN) return errorResponse('SERVER_ERROR', 'Bot token not configured', 500);
 
         const db = env.DB;
         const kv = env.KV;
+        const cache = caches.default;
 
         // ============================================================
-        // BOT WEBHOOK: /webhook
+        // WEBHOOK
         // ============================================================
         if (path === '/webhook' && method === 'POST') {
-            console.log('========== WEBHOOK START ==========');
-            console.log('Method:', request.method);
-            console.log('Path:', path);
+            if (config.WEBHOOK_SECRET) {
+                const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
+                if (got !== config.WEBHOOK_SECRET) {
+                    return new Response('Forbidden', { status: 403 });
+                }
+            }
 
             try {
                 const update = await request.json();
-                console.log('Update:', JSON.stringify(update));
 
-                // پردازش پیام‌های معمولی (مثل دستور /start)
-                if (update.message) {
-                    console.log('Message detected');
-                    console.log('Text:', update.message.text);
-                    console.log('Chat ID:', update.message.chat?.id);
-                    console.log('User:', update.message.from?.first_name);
-
+                if (update.message && update.message.text === '/start') {
                     const chatId = update.message.chat.id;
                     const firstName = update.message.from.first_name || 'User';
-                    const text = update.message.text || '';
-
-                    if (text === '/start') {
-                        console.log('Calling sendWelcomeMessage...');
-                        await sendWelcomeMessage(chatId, firstName, config.TELEGRAM_BOT_TOKEN);
-                        console.log('sendWelcomeMessage completed');
-                    }
+                    ctx.waitUntil(
+                        sendWelcomeMessage(chatId, firstName, config.TELEGRAM_BOT_TOKEN).catch(e => console.error(e))
+                    );
                 }
 
-                // پردازش رویدادهای پرداخت موفق Stars
                 if (update.message && update.message.successful_payment) {
                     const payment = update.message.successful_payment;
                     const payload = payment.invoice_payload;
                     const telegramId = update.message.from.id.toString();
 
-                    const result = await db.prepare(
-                        'UPDATE payments SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE invoice_id = ? AND telegram_id = ?'
-                    ).bind('paid', payload, telegramId).run();
+                    const rec = await db.prepare(
+                        'SELECT * FROM payments WHERE invoice_id = ? AND telegram_id = ? AND status = ?'
+                    ).bind(payload, telegramId, 'pending').first();
 
-                    if (result.changes > 0) {
-                        const payRecord = await db.prepare(
-                            'SELECT * FROM payments WHERE invoice_id = ? AND telegram_id = ?'
-                        ).bind(payload, telegramId).first();
-
-                        if (payRecord) {
-                            await db.prepare(
-                                'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?'
-                            ).bind(payRecord.coins, telegramId).run();
-
-                            await fetch('https://api.telegram.org/bot' + config.TELEGRAM_BOT_TOKEN + '/sendMessage', {
+                    if (rec) {
+                        await db.batch([
+                            db.prepare('UPDATE payments SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+                                .bind('paid', rec.id),
+                            db.prepare('UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?')
+                                .bind(rec.coins, telegramId),
+                        ]);
+                        ctx.waitUntil(fetch(
+                            'https://api.telegram.org/bot' + config.TELEGRAM_BOT_TOKEN + '/sendMessage',
+                            {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({
                                     chat_id: telegramId,
-                                    text: '✅ Payment confirmed! Your tokens have been added to your balance.',
+                                    text: '✅ Payment confirmed! Your tokens have been added to your balance.'
                                 })
-                            });
-                        }
-                    } else {
-                        console.warn('Payment record not found for payload:', payload);
+                            }
+                        ));
                     }
                 }
 
                 return new Response('OK', { headers: CORS_HEADERS });
-            } catch (error) {
-                console.error('Webhook error:', error);
-                return new Response('Error: ' + error.message, { status: 500, headers: CORS_HEADERS });
+            } catch (e) {
+                console.error('Webhook error:', e);
+                return new Response('Error', { status: 500, headers: CORS_HEADERS });
             }
         }
 
         // ============================================================
-        // SETWEBHOOK
+        // SETWEBHOOK (with ADMIN_TOKEN)
         // ============================================================
-        if (path === '/setwebhook' && method === 'GET') {
-            try {
-                const workerUrl = `https://${url.hostname}/webhook`;
-
-                const response = await fetch(
-                    `https://api.telegram.org/bot${config.TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(workerUrl)}`
-                );
-                const result = await response.json();
-
-                return new Response(JSON.stringify(result, null, 2), {
-                    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS }
-                });
-            } catch (error) {
-                return new Response('Error: ' + error.message, { status: 500, headers: CORS_HEADERS });
+        if (path === '/setwebhook' && method === 'POST') {
+            const auth = request.headers.get('Authorization') || '';
+            const adminToken = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+            if (!config.ADMIN_TOKEN || adminToken !== config.ADMIN_TOKEN) {
+                return errorResponse('FORBIDDEN', 'Invalid admin token', 403);
             }
+            const workerUrl = 'https://' + url.hostname + '/webhook';
+            const setUrl = new URL('https://api.telegram.org/bot' + config.TELEGRAM_BOT_TOKEN + '/setWebhook');
+            setUrl.searchParams.set('url', workerUrl);
+            if (config.WEBHOOK_SECRET) {
+                setUrl.searchParams.set('secret_token', config.WEBHOOK_SECRET);
+            }
+            const res = await fetch(setUrl.toString());
+            const data = await res.json();
+            return jsonResponse(data, res.status);
         }
 
         // ============================================================
-        // HEALTH CHECK
+        // HEALTH
         // ============================================================
         if (path === '/health' || path === '/') {
-            return new Response('✅ Daimonium Backend is running!', { headers: CORS_HEADERS });
+            return new Response('✅ Daimonium V9.2 running', { headers: CORS_HEADERS });
         }
 
         // ============================================================
-        // RATE LIMITING (به جز webhook و test endpoints)
+        // RATE LIMIT
         // ============================================================
-        if (path !== '/webhook' && !path.startsWith('/test/')) {
+        if (path !== '/webhook') {
             const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
-            const limitKey = `ip:${clientIp}:${path}`;
-            let limit = 100;
-            if (path === '/auth') limit = 60;
+            const limitKey = 'ip:' + clientIp + ':' + path;
+            let limit = 120;
+            if (path === '/bootstrap') limit = 60;
+            else if (path === '/auth') limit = 60;
             else if (path.startsWith('/payments/')) limit = 30;
-            else if (path.startsWith('/tasks/')) limit = 50;
-            else if (path.startsWith('/referral/')) limit = 30;
-            else if (path === '/user/verify') limit = 100;
+            else if (path === '/sync') limit = 60;
+            else if (path === '/ton/jetton-wallet') limit = 30;   // ✅ V9.2: از 60 به 30
 
             const allowed = await checkRateLimit(kv, limitKey, limit, 60);
-            if (!allowed) {
-                console.warn(`Rate limit exceeded: IP=${clientIp}, path=${path}, limit=${limit}/60s`);
-                return errorResponse('RATE_LIMITED', 'Too many requests', 429);
+            if (!allowed) return errorResponse('RATE_LIMITED', 'Too many requests', 429);
+        }
+
+        // ============================================================
+        // /ton/jetton-wallet — Proxy to tonapi.io (public)
+        // ============================================================
+        if (path === '/ton/jetton-wallet' && method === 'GET') {
+            try {
+                const owner = url.searchParams.get('owner');
+                const master = url.searchParams.get('master') || config.USDT_JETTON_ADDRESS;
+                if (!owner || !master) {
+                    return errorResponse('INVALID_REQUEST', 'Missing owner or master', 400);
+                }
+                if (!isValidTonAddress(owner)) {
+                    return errorResponse('INVALID_WALLET', 'Invalid owner address', 400);
+                }
+
+                const res = await fetch(
+                    'https://tonapi.io/v2/accounts/' + encodeURIComponent(owner) + '/jettons/' + encodeURIComponent(master),
+                    {
+                        headers: config.TON_API_KEY ? { 'Authorization': 'Bearer ' + config.TON_API_KEY } : {},
+                        signal: AbortSignal.timeout(8000),
+                    }
+                );
+                if (!res.ok) {
+                    return jsonResponse({
+                        wallet_address: null,
+                        error: 'tonapi returned ' + res.status
+                    });
+                }
+                const data = await res.json();
+                return jsonResponse({
+                    wallet_address: (data.wallet_address && data.wallet_address.address) || null,
+                    balance: data.balance || '0',
+                    jetton: data.jetton || null,
+                });
+            } catch (e) {
+                console.error('Jetton wallet lookup error:', e);
+                return jsonResponse({ wallet_address: null, error: e.message });
             }
         }
 
         // ============================================================
-        // 1. POST /auth
+        // /bootstrap
+        // ============================================================
+        if (path === '/bootstrap' && method === 'GET') {
+            try {
+                let telegramId = await getUserFromJWT(request, config.JWT_SECRET);
+
+                const initDataHeader = request.headers.get('X-Telegram-Init-Data');
+                if (!telegramId && initDataHeader) {
+                    const user = await verifyTelegramInitData(initDataHeader, config.TELEGRAM_BOT_TOKEN);
+                    if (user) {
+                        telegramId = user.id.toString();
+                        const username = user.username || '';
+                        const firstName = user.first_name || '';
+
+                        const existing = await db.prepare('SELECT id FROM users WHERE telegram_id = ?')
+                            .bind(telegramId).first();
+                        if (!existing) {
+                            await db.prepare(
+                                'INSERT INTO users (telegram_id, username, first_name) VALUES (?, ?, ?)'
+                            ).bind(telegramId, username, firstName).run();
+                        } else {
+                            await db.prepare(
+                                'UPDATE users SET username = ?, first_name = ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?'
+                            ).bind(username, firstName, telegramId).run();
+                        }
+                    }
+                }
+
+                const configData = await loadConfig(kv, db, cache, ctx);
+
+                if (!telegramId) {
+                    return jsonResponse({ config: configData, user: null, token: null });
+                }
+
+                // referral ثبت
+                const refParam = url.searchParams.get('ref');
+                if (refParam && refParam !== telegramId) {
+                    const existing = await db.prepare('SELECT id FROM referrals WHERE referred_id = ?')
+                        .bind(telegramId).first();
+                    if (!existing) {
+                        const referrer = await db.prepare('SELECT telegram_id FROM users WHERE telegram_id = ?')
+                            .bind(refParam).first();
+                        if (referrer) {
+                            await db.batch([
+                                db.prepare('INSERT INTO referrals (referrer_id, referred_id) VALUES (?, ?)')
+                                    .bind(refParam, telegramId),
+                                db.prepare('UPDATE users SET referrals_count = referrals_count + 1, balance = balance + 100 WHERE telegram_id = ?')
+                                    .bind(refParam),
+                            ]);
+                        }
+                    }
+                }
+
+                const [user, wallet] = await Promise.all([
+                    db.prepare('SELECT * FROM users WHERE telegram_id = ?').bind(telegramId).first(),
+                    db.prepare('SELECT wallet_address FROM wallets WHERE telegram_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1')
+                        .bind(telegramId).first(),
+                ]);
+
+                if (!user) {
+                    return jsonResponse({ config: configData, user: null, token: null });
+                }
+
+                const token = await generateJWT(
+                    { sub: telegramId, userId: user.id, telegramId },
+                    config.JWT_SECRET,
+                    JWT_EXPIRES
+                );
+
+                return jsonResponse({
+                    config: configData,
+                    user: {
+                        telegramId: user.telegram_id,
+                        firstName: user.first_name,
+                        username: user.username,
+                        balance: user.balance || 0,
+                        referrals: user.referrals_count || 0,
+                        walletAddress: wallet ? wallet.wallet_address : null,
+                    },
+                    token,
+                });
+            } catch (e) {
+                console.error('Bootstrap error:', e);
+                return errorResponse('SERVER_ERROR', e.message, 500);
+            }
+        }
+
+        // ============================================================
+        // /auth (سازگاری)
         // ============================================================
         if (path === '/auth' && method === 'POST') {
             try {
                 const body = await request.json();
                 const initData = body.initData;
-                if (!initData) {
-                    return errorResponse('AUTH_FAILED', 'Missing initData', 400);
-                }
+                if (!initData) return errorResponse('AUTH_FAILED', 'Missing initData', 400);
 
                 const user = await verifyTelegramInitData(initData, config.TELEGRAM_BOT_TOKEN);
-                if (!user) {
-                    return errorResponse('AUTH_FAILED', 'Invalid initData', 401);
-                }
+                if (!user) return errorResponse('AUTH_FAILED', 'Invalid initData', 401);
 
                 const telegramId = user.id.toString();
                 const username = user.username || '';
@@ -504,121 +578,64 @@ export default {
 
                 let dbUser = await db.prepare('SELECT * FROM users WHERE telegram_id = ?').bind(telegramId).first();
                 if (!dbUser) {
-                    await db.prepare(
-                        'INSERT INTO users (telegram_id, username, first_name) VALUES (?, ?, ?)'
-                    ).bind(telegramId, username, firstName).run();
+                    await db.prepare('INSERT INTO users (telegram_id, username, first_name) VALUES (?, ?, ?)')
+                        .bind(telegramId, username, firstName).run();
                     dbUser = await db.prepare('SELECT * FROM users WHERE telegram_id = ?').bind(telegramId).first();
                 } else {
-                    await db.prepare(
-                        'UPDATE users SET username = ?, first_name = ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?'
-                    ).bind(username, firstName, telegramId).run();
+                    await db.prepare('UPDATE users SET username = ?, first_name = ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ?')
+                        .bind(username, firstName, telegramId).run();
                 }
 
                 const wallet = await db.prepare(
                     'SELECT wallet_address FROM wallets WHERE telegram_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1'
                 ).bind(telegramId).first();
-                const walletAddress = wallet?.wallet_address || null;
 
-                const token = await generateJWT({
-                    sub: telegramId,
-                    userId: dbUser.id,
-                    telegramId: telegramId,
-                }, config.JWT_SECRET, 604800);
+                const token = await generateJWT(
+                    { sub: telegramId, userId: dbUser.id, telegramId },
+                    config.JWT_SECRET, JWT_EXPIRES
+                );
 
                 return jsonResponse({
                     success: true,
-                    token: token,
+                    token,
                     user: {
-                        telegramId: telegramId,
-                        firstName: firstName,
-                        username: username,
+                        telegramId,
+                        firstName,
+                        username,
                         balance: dbUser.balance || 0,
                         referrals: dbUser.referrals_count || 0,
-                        walletAddress: walletAddress,
+                        walletAddress: wallet ? wallet.wallet_address : null,
                     }
                 });
             } catch (e) {
-                console.error('Auth error:', e);
                 return errorResponse('AUTH_FAILED', e.message, 500);
             }
         }
 
         // ============================================================
-        // 2. GET /user/verify
-        // ============================================================
-        if (path === '/user/verify' && method === 'GET') {
-            try {
-                const telegramId = await getUserFromJWT(request, config.JWT_SECRET);
-                if (!telegramId) {
-                    return errorResponse('AUTH_FAILED', 'Invalid or missing token', 401);
-                }
-                const user = await db.prepare('SELECT telegram_id FROM users WHERE telegram_id = ?').bind(telegramId).first();
-                if (!user) {
-                    return errorResponse('AUTH_FAILED', 'User not found', 401);
-                }
-                return jsonResponse({ valid: true });
-            } catch (e) {
-                return jsonResponse({ valid: false }, 401);
-            }
-        }
-
-        // ============================================================
-        // 3. GET /config
+        // /config (public)
         // ============================================================
         if (path === '/config' && method === 'GET') {
             try {
-                let cached = await kv.get('config_cache');
-                if (cached) {
-                    const parsed = JSON.parse(cached);
-                    return jsonResponse(parsed, 200, {
-                        'Cache-Control': 'public, max-age=604800',
-                    });
-                }
-
-                const features = await db.prepare('SELECT value FROM config WHERE key = ?').bind('features').first();
-                const packages = await db.prepare('SELECT value FROM config WHERE key = ?').bind('package_prices').first();
-
-                const configData = {
-                    features: features ? JSON.parse(features.value) : {
-                        stars: true,
-                        ton: true,
-                        referral: true,
-                        tasks: true,
-                        walletConnect: true,
-                        ads: true,
-                    },
-                    packages: packages ? JSON.parse(packages.value) : PACKAGE_DEFINITIONS
-                };
-
-                await kv.put('config_cache', JSON.stringify(configData), { expirationTtl: CONFIG_CACHE_TTL });
-
-                return jsonResponse(configData, 200, {
-                    'Cache-Control': 'public, max-age=604800',
-                });
+                const data = await loadConfig(kv, db, cache, ctx);
+                return jsonResponse(data, 200, { 'Cache-Control': 'public, max-age=86400' });
             } catch (e) {
-                console.error('Config error:', e);
                 return jsonResponse({
-                    features: {
-                        stars: true,
-                        ton: true,
-                        referral: true,
-                        tasks: true,
-                        walletConnect: true,
-                        ads: true,
-                    },
+                    features: { stars: true, ton: true, referral: true, tasks: true, walletConnect: true, ads: false },
                     packages: PACKAGE_DEFINITIONS
-                }, 200, {
-                    'Cache-Control': 'public, max-age=604800',
-                });
+                }, 200);
             }
         }
 
         // ============================================================
-        // MIDDLEWARE: JWT برای تمام مسیرهای محافظت‌شده
+        // AUTH MIDDLEWARE
         // ============================================================
+        const publicPaths = [
+            '/auth', '/config', '/webhook', '/setwebhook', '/health', '/',
+            '/bootstrap', '/ton/jetton-wallet'
+        ];
         let telegramId = null;
-
-        if (path !== '/auth' && path !== '/config' && path !== '/webhook' && path !== '/setwebhook' && path !== '/health' && path !== '/' && !path.startsWith('/test/')) {
+        if (!publicPaths.includes(path)) {
             telegramId = await getUserFromJWT(request, config.JWT_SECRET);
             if (!telegramId) {
                 return errorResponse('AUTH_FAILED', 'Invalid or missing token', 401);
@@ -626,42 +643,158 @@ export default {
         }
 
         // ============================================================
-        // 4. GET /user/profile
+        // /user/verify
+        // ============================================================
+        if (path === '/user/verify' && method === 'GET') {
+            const user = await db.prepare('SELECT telegram_id FROM users WHERE telegram_id = ?').bind(telegramId).first();
+            if (!user) return errorResponse('AUTH_FAILED', 'User not found', 401);
+            return jsonResponse({ valid: true });
+        }
+
+        // ============================================================
+        // /user/profile
         // ============================================================
         if (path === '/user/profile' && method === 'GET') {
+            const user = await db.prepare('SELECT * FROM users WHERE telegram_id = ?').bind(telegramId).first();
+            if (!user) return errorResponse('USER_NOT_FOUND', 'User not found', 404);
+            const wallet = await db.prepare(
+                'SELECT wallet_address FROM wallets WHERE telegram_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1'
+            ).bind(telegramId).first();
+            return jsonResponse({
+                telegramId: user.telegram_id,
+                firstName: user.first_name,
+                username: user.username,
+                balance: user.balance || 0,
+                referrals: user.referrals_count || 0,
+                walletAddress: wallet ? wallet.wallet_address : null,
+            });
+        }
+
+        // ============================================================
+        // /sync — یکپارچه (V9.2 FIXED — جلوگیری از double-reward)
+        // ============================================================
+        if (path === '/sync' && method === 'POST') {
             try {
-                const user = await db.prepare('SELECT * FROM users WHERE telegram_id = ?').bind(telegramId).first();
-                if (!user) {
-                    return errorResponse('USER_NOT_FOUND', 'User not found', 404);
+                const body = await request.json();
+                const events = Array.isArray(body.events) ? body.events : [];
+                if (events.length === 0) {
+                    const u = await db.prepare('SELECT balance, referrals_count FROM users WHERE telegram_id = ?')
+                        .bind(telegramId).first();
+                    return jsonResponse({
+                        success: true,
+                        reward: 0,
+                        balance: (u && u.balance) || 0,
+                        referrals: (u && u.referrals_count) || 0
+                    });
                 }
-                const wallet = await db.prepare(
-                    'SELECT wallet_address FROM wallets WHERE telegram_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1'
-                ).bind(telegramId).first();
+                if (events.length > 50) return errorResponse('TOO_MANY_EVENTS', 'Max 50 events per sync', 400);
+
+                let totalReward = 0;
+                const batchOps = [];
+                const seenTaskKeys = new Set();      // ✅ V9.2: dedupe درون batch
+                const seenInviteKeys = new Set();    // ✅ V9.2: dedupe درون batch
+
+                for (const ev of events) {
+                    if (!ev || typeof ev !== 'object' || !ev.type) continue;
+
+                    // ----- تسک روزانه -----
+                    if (ev.type === 'task_completed') {
+                        const taskId = ev.data && ev.data.taskId;
+                        const date = ev.data && ev.data.date;
+                        const reward = TASK_REWARDS[taskId];
+                        if (!reward || !date) continue;
+                        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+
+                        // ✅ dedupe درون همین batch
+                        const key = taskId + '|' + date;
+                        if (seenTaskKeys.has(key)) continue;
+                        seenTaskKeys.add(key);
+
+                        // ✅ V9.2: چک تکراری نبودن در DB قبل از اضافه کردن reward
+                        const already = await db.prepare(
+                            'SELECT id FROM user_tasks WHERE telegram_id = ? AND task_id = ? AND done_date = ?'
+                        ).bind(telegramId, taskId, date).first();
+                        if (already) continue;   // ← اگر قبلاً انجام شده، reward اضافه نکن
+
+                        batchOps.push(
+                            db.prepare('INSERT OR IGNORE INTO user_tasks (telegram_id, task_id, done_date) VALUES (?, ?, ?)')
+                                .bind(telegramId, taskId, date)
+                        );
+                        totalReward += reward;
+                    }
+                    // ----- تسک دعوت -----
+                    else if (ev.type === 'invite_claim') {
+                        const task = ev.data && ev.data.task;
+                        const cfg = REFERRAL_REWARDS[task];
+                        if (!cfg) continue;
+
+                        // ✅ dedupe درون همین batch
+                        if (seenInviteKeys.has(task)) continue;
+                        seenInviteKeys.add(task);
+
+                        const u = await db.prepare('SELECT referrals_count FROM users WHERE telegram_id = ?')
+                            .bind(telegramId).first();
+                        if (!u || u.referrals_count < cfg.required) continue;
+
+                        const already = await db.prepare('SELECT id FROM referral_rewards WHERE telegram_id = ? AND task = ?')
+                            .bind(telegramId, task).first();
+                        if (already) continue;
+
+                        batchOps.push(
+                            db.prepare('INSERT OR IGNORE INTO referral_rewards (telegram_id, task, reward) VALUES (?, ?, ?)')
+                                .bind(telegramId, task, cfg.reward)
+                        );
+                        totalReward += cfg.reward;
+                    }
+                    // ----- سایر events -----
+                    else {
+                        batchOps.push(
+                            db.prepare('INSERT INTO events (telegram_id, event_type, data) VALUES (?, ?, ?)')
+                                .bind(telegramId, ev.type, JSON.stringify(ev.data || {}))
+                        );
+                    }
+                }
+
+                if (batchOps.length > 0) {
+                    await db.batch(batchOps);
+                }
+
+                let newBalance;
+                if (totalReward > 0) {
+                    newBalance = await db.prepare(
+                        'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ? RETURNING balance, referrals_count'
+                    ).bind(totalReward, telegramId).first();
+                } else {
+                    newBalance = await db.prepare(
+                        'SELECT balance, referrals_count FROM users WHERE telegram_id = ?'
+                    ).bind(telegramId).first();
+                }
+
                 return jsonResponse({
-                    telegramId: user.telegram_id,
-                    firstName: user.first_name,
-                    username: user.username,
-                    balance: user.balance || 0,
-                    referrals: user.referrals_count || 0,
-                    walletAddress: wallet?.wallet_address || null,
+                    success: true,
+                    reward: totalReward,
+                    balance: (newBalance && newBalance.balance) || 0,
+                    referrals: (newBalance && newBalance.referrals_count) || 0,
                 });
             } catch (e) {
+                console.error('Sync error:', e);
                 return errorResponse('SERVER_ERROR', e.message, 500);
             }
         }
 
         // ============================================================
-        // 5. POST /user/sync
+        // /user/sync (سازگاری)
         // ============================================================
         if (path === '/user/sync' && method === 'POST') {
             try {
                 const body = await request.json();
                 const events = body.events || [];
                 if (events.length > 0) {
-                    const stmt = db.prepare('INSERT INTO events (telegram_id, event_type, data) VALUES (?, ?, ?)');
-                    for (const ev of events) {
-                        await stmt.bind(telegramId, ev.type, JSON.stringify(ev.data || {})).run();
-                    }
+                    const ops = events.map(ev =>
+                        db.prepare('INSERT INTO events (telegram_id, event_type, data) VALUES (?, ?, ?)')
+                            .bind(telegramId, ev.type, JSON.stringify(ev.data || {}))
+                    );
+                    await db.batch(ops);
                 }
                 return jsonResponse({ success: true, count: events.length });
             } catch (e) {
@@ -670,29 +803,25 @@ export default {
         }
 
         // ============================================================
-        // 6. POST /wallet/connect
+        // /wallet/connect
         // ============================================================
         if (path === '/wallet/connect' && method === 'POST') {
             try {
                 const body = await request.json();
                 const walletAddress = body.walletAddress;
-                if (!walletAddress) {
-                    return errorResponse('INVALID_REQUEST', 'Missing walletAddress', 400);
-                }
-                if (!isValidTonAddress(walletAddress)) {
-                    return errorResponse('INVALID_WALLET', 'Invalid TON address format', 400);
-                }
+                if (!walletAddress) return errorResponse('INVALID_REQUEST', 'Missing walletAddress', 400);
+                if (!isValidTonAddress(walletAddress)) return errorResponse('INVALID_WALLET', 'Invalid TON address', 400);
+
                 const existing = await db.prepare(
                     'SELECT id FROM wallets WHERE telegram_id = ? AND wallet_address = ?'
                 ).bind(telegramId, walletAddress).first();
-                if (!existing) {
-                    await db.prepare(
-                        'INSERT INTO wallets (telegram_id, wallet_address) VALUES (?, ?)'
-                    ).bind(telegramId, walletAddress).run();
+
+                if (existing) {
+                    await db.prepare('UPDATE wallets SET is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+                        .bind(existing.id).run();
                 } else {
-                    await db.prepare(
-                        'UPDATE wallets SET is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?'
-                    ).bind(existing.id).run();
+                    await db.prepare('INSERT INTO wallets (telegram_id, wallet_address) VALUES (?, ?)')
+                        .bind(telegramId, walletAddress).run();
                 }
                 return jsonResponse({ success: true, walletAddress });
             } catch (e) {
@@ -701,13 +830,11 @@ export default {
         }
 
         // ============================================================
-        // 7. POST /wallet/disconnect
+        // /wallet/disconnect
         // ============================================================
         if (path === '/wallet/disconnect' && method === 'POST') {
             try {
-                await db.prepare(
-                    'UPDATE wallets SET is_active = 0 WHERE telegram_id = ?'
-                ).bind(telegramId).run();
+                await db.prepare('UPDATE wallets SET is_active = 0 WHERE telegram_id = ?').bind(telegramId).run();
                 return jsonResponse({ success: true });
             } catch (e) {
                 return errorResponse('SERVER_ERROR', e.message, 500);
@@ -715,63 +842,63 @@ export default {
         }
 
         // ============================================================
-        // 8. POST /payments/ton/verify
+        // /payments/ton/verify — امن (recipient از env)
         // ============================================================
         if (path === '/payments/ton/verify' && method === 'POST') {
             try {
                 const body = await request.json();
-                const { boc, packageId, usdPrice, recipientAddress } = body;
-                if (!boc || !packageId) {
-                    return errorResponse('INVALID_REQUEST', 'Missing boc or packageId', 400);
-                }
-                if (!recipientAddress) {
-                    return errorResponse('INVALID_REQUEST', 'Missing recipientAddress', 400);
-                }
-                if (!isValidTonAddress(recipientAddress)) {
-                    return errorResponse('INVALID_WALLET', 'Invalid recipient address format', 400);
-                }
+                const packageId = body.packageId;
+                if (!packageId) return errorResponse('INVALID_REQUEST', 'Missing packageId', 400);
 
-                const packages = await db.prepare('SELECT value FROM config WHERE key = ?').bind('package_prices').first();
-                const packageData = packages ? JSON.parse(packages.value) : PACKAGE_DEFINITIONS;
+                // ✅ آدرس گیرنده از env (هرگز از کلاینت!)
+                const expectedRecipient = config.TON_RECIPIENT;
+
+                const packagesRow = await db.prepare('SELECT value FROM config WHERE key = ?').bind('package_prices').first();
+                const packageData = packagesRow ? JSON.parse(packagesRow.value) : PACKAGE_DEFINITIONS;
                 const pkg = packageData[packageId];
-                if (!pkg) {
-                    return errorResponse('INVALID_PACKAGE', 'Invalid package', 400);
-                }
+                if (!pkg) return errorResponse('INVALID_PACKAGE', 'Invalid package', 400);
 
-                const verification = await verifyTonTransaction(
-                    boc,
+                // ✅ کیف پول کاربر از DB
+                const wallet = await db.prepare(
+                    'SELECT wallet_address FROM wallets WHERE telegram_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1'
+                ).bind(telegramId).first();
+                if (!wallet) return errorResponse('WALLET_NOT_CONNECTED', 'Connect wallet first', 400);
+
+                const match = await findMatchingJettonTransfer(
+                    wallet.wallet_address,
                     pkg.usdt,
-                    recipientAddress,
+                    expectedRecipient,
                     config.TON_API_KEY
                 );
-                if (!verification.valid) {
-                    return errorResponse('PAYMENT_VERIFICATION_FAILED', verification.error, 400);
+
+                if (!match || match.error) {
+                    return jsonResponse({
+                        verified: false,
+                        pending: true,
+                        message: (match && match.error) || 'Waiting for blockchain confirmation...'
+                    });
                 }
 
-                const existing = await db.prepare(
-                    'SELECT * FROM processed_transactions WHERE tx_hash = ?'
-                ).bind(verification.txHash).first();
-                if (existing) {
-                    return errorResponse('PAYMENT_REPLAY', 'Transaction already processed', 400);
-                }
+                const existing = await db.prepare('SELECT * FROM processed_transactions WHERE tx_hash = ?')
+                    .bind(match.txHash).first();
+                if (existing) return errorResponse('PAYMENT_REPLAY', 'Already processed', 400);
 
-                await db.prepare(
-                    'INSERT INTO processed_transactions (tx_hash, telegram_id) VALUES (?, ?)'
-                ).bind(verification.txHash, telegramId).run();
+                await db.batch([
+                    db.prepare('INSERT INTO processed_transactions (tx_hash, telegram_id) VALUES (?, ?)')
+                        .bind(match.txHash, telegramId),
+                    db.prepare('INSERT INTO payments (telegram_id, type, package_id, amount, coins, tx_hash, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                        .bind(telegramId, 'ton', packageId, pkg.usdt, pkg.coins, match.txHash, 'paid'),
+                ]);
 
-                await db.prepare(
-                    'INSERT INTO payments (telegram_id, type, package_id, amount, coins, tx_hash, status) VALUES (?, ?, ?, ?, ?, ?, ?)'
-                ).bind(telegramId, 'ton', packageId, pkg.usdt, pkg.coins, verification.txHash, 'paid').run();
-
-                const newBalance = await db.prepare(
+                const newBal = await db.prepare(
                     'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ? RETURNING balance'
                 ).bind(pkg.coins, telegramId).first();
 
                 return jsonResponse({
                     verified: true,
                     coins: pkg.coins,
-                    balance: newBalance?.balance || 0,
-                    txHash: verification.txHash,
+                    balance: (newBal && newBal.balance) || 0,
+                    txHash: match.txHash,
                 });
             } catch (e) {
                 console.error('TON verify error:', e);
@@ -780,57 +907,42 @@ export default {
         }
 
         // ============================================================
-        // 9. POST /payments/stars/create
+        // /payments/stars/create — amount از سرور
         // ============================================================
         if (path === '/payments/stars/create' && method === 'POST') {
             try {
                 const body = await request.json();
-                const { packageId, amount, coins } = body;
-                if (!packageId || !amount) {
-                    return errorResponse('INVALID_REQUEST', 'Missing packageId or amount', 400);
-                }
+                const packageId = body.packageId;
+                if (!packageId) return errorResponse('INVALID_REQUEST', 'Missing packageId', 400);
 
-                const packages = await db.prepare('SELECT value FROM config WHERE key = ?').bind('package_prices').first();
-                const packageData = packages ? JSON.parse(packages.value) : PACKAGE_DEFINITIONS;
+                const packagesRow = await db.prepare('SELECT value FROM config WHERE key = ?').bind('package_prices').first();
+                const packageData = packagesRow ? JSON.parse(packagesRow.value) : PACKAGE_DEFINITIONS;
                 const pkg = packageData[packageId];
-                if (!pkg) {
-                    return errorResponse('INVALID_PACKAGE', 'Invalid package', 400);
-                }
+                if (!pkg) return errorResponse('INVALID_PACKAGE', 'Invalid package', 400);
 
+                // ✅ amount از سرور (نه از کلاینت)
+                const amount = pkg.stars;
                 const invoicePayload = 'stars_' + Date.now() + '_' + telegramId;
 
-                const invoiceData = {
-                    chat_id: telegramId,
-                    title: 'Daimonium Token Package',
-                    description: `Purchase ${pkg.coins} Daimonium tokens`,
-                    payload: invoicePayload,
-                    provider_token: '',
-                    currency: 'XTR',
-                    prices: [{ label: `${pkg.coins} Daimonium Tokens`, amount: amount }],
-                    start_parameter: invoicePayload,
-                };
-
-                const response = await fetch('https://api.telegram.org/bot' + config.TELEGRAM_BOT_TOKEN + '/createInvoiceLink', {
+                const res = await fetch('https://api.telegram.org/bot' + config.TELEGRAM_BOT_TOKEN + '/createInvoiceLink', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(invoiceData)
+                    body: JSON.stringify({
+                        title: 'Daimonium Token Package',
+                        description: 'Purchase ' + pkg.coins + ' Daimonium tokens',
+                        payload: invoicePayload,
+                        currency: 'XTR',
+                        prices: [{ label: pkg.coins + ' Daimonium Tokens', amount: amount }],
+                    })
                 });
-                const result = await response.json();
-                if (!result.ok) {
-                    return errorResponse('INVOICE_FAILED', result.description || 'Telegram API error', 500);
-                }
-
-                const invoiceLink = result.result;
+                const result = await res.json();
+                if (!result.ok) return errorResponse('INVOICE_FAILED', result.description || 'Telegram error', 500);
 
                 await db.prepare(
                     'INSERT INTO payments (telegram_id, type, package_id, amount, coins, invoice_id, status) VALUES (?, ?, ?, ?, ?, ?, ?)'
                 ).bind(telegramId, 'stars', packageId, amount, pkg.coins, invoicePayload, 'pending').run();
 
-                return jsonResponse({
-                    success: true,
-                    invoiceLink: invoiceLink,
-                    paymentId: invoicePayload,
-                });
+                return jsonResponse({ success: true, invoiceLink: result.result, paymentId: invoicePayload });
             } catch (e) {
                 console.error('Stars create error:', e);
                 return errorResponse('SERVER_ERROR', e.message, 500);
@@ -838,31 +950,22 @@ export default {
         }
 
         // ============================================================
-        // 10. GET /payments/:id
+        // /payments/:id
         // ============================================================
         if (path.startsWith('/payments/') && method === 'GET') {
             try {
                 const paymentId = path.split('/')[2];
-                if (!paymentId) {
-                    return errorResponse('INVALID_REQUEST', 'Missing payment id', 400);
-                }
+                if (!paymentId) return errorResponse('INVALID_REQUEST', 'Missing payment id', 400);
 
                 const payment = await db.prepare(
                     'SELECT * FROM payments WHERE telegram_id = ? AND (id = ? OR invoice_id = ? OR tx_hash = ?) ORDER BY created_at DESC LIMIT 1'
                 ).bind(telegramId, paymentId, paymentId, paymentId).first();
-
-                if (!payment) {
-                    return errorResponse('PAYMENT_NOT_FOUND', 'Payment not found', 404);
-                }
+                if (!payment) return errorResponse('PAYMENT_NOT_FOUND', 'Payment not found', 404);
 
                 if (payment.status === 'pending') {
                     const created = new Date(payment.created_at);
-                    const now = new Date();
-                    const diff = (now - created) / 1000;
-                    if (diff > 600) {
-                        await db.prepare(
-                            'UPDATE payments SET status = ? WHERE id = ?'
-                        ).bind('expired', payment.id).run();
+                    if ((Date.now() - created.getTime()) / 1000 > 600) {
+                        await db.prepare('UPDATE payments SET status = ? WHERE id = ?').bind('expired', payment.id).run();
                         payment.status = 'expired';
                     }
                 }
@@ -876,7 +979,7 @@ export default {
                     type: payment.type,
                     packageId: payment.package_id,
                     createdAt: payment.created_at,
-                    balance: balance?.balance || 0,
+                    balance: (balance && balance.balance) || 0,
                 });
             } catch (e) {
                 return errorResponse('SERVER_ERROR', e.message, 500);
@@ -884,161 +987,46 @@ export default {
         }
 
         // ============================================================
-        // 11. POST /tasks/complete
+        // /tasks/complete (سازگاری)
         // ============================================================
         if (path === '/tasks/complete' && method === 'POST') {
             try {
                 const body = await request.json();
                 const taskId = body.taskId;
-                if (!taskId) {
-                    return errorResponse('INVALID_REQUEST', 'Missing taskId', 400);
-                }
+                if (!taskId) return errorResponse('INVALID_REQUEST', 'Missing taskId', 400);
 
                 const reward = TASK_REWARDS[taskId];
-                if (!reward) {
-                    return errorResponse('INVALID_TASK', 'Invalid task', 400);
-                }
+                if (!reward) return errorResponse('INVALID_TASK', 'Invalid task', 400);
 
                 const done = await db.prepare(
                     'SELECT * FROM user_tasks WHERE telegram_id = ? AND task_id = ? AND done_date = date("now")'
                 ).bind(telegramId, taskId).first();
-                if (done) {
-                    return errorResponse('TASK_ALREADY_DONE', 'Task already completed today', 400);
-                }
+                if (done) return errorResponse('TASK_ALREADY_DONE', 'Already done today', 400);
 
-                await db.prepare(
-                    'INSERT INTO user_tasks (telegram_id, task_id, done_date) VALUES (?, ?, date("now"))'
-                ).bind(telegramId, taskId).run();
+                await db.batch([
+                    db.prepare('INSERT OR IGNORE INTO user_tasks (telegram_id, task_id, done_date) VALUES (?, ?, date("now"))')
+                        .bind(telegramId, taskId),
+                ]);
 
                 const newBalance = await db.prepare(
                     'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ? RETURNING balance'
                 ).bind(reward, telegramId).first();
 
-                return jsonResponse({
-                    success: true,
-                    reward: reward,
-                    balance: newBalance?.balance || 0,
-                });
+                return jsonResponse({ success: true, reward, balance: (newBalance && newBalance.balance) || 0 });
             } catch (e) {
                 return errorResponse('SERVER_ERROR', e.message, 500);
             }
         }
 
         // ============================================================
-        // 12. POST /ads/reward
+        // /ads/reward — غیرفعال
         // ============================================================
         if (path === '/ads/reward' && method === 'POST') {
-            try {
-                const body = await request.json();
-                const progress = body.progress || 0;
-                const reward = body.reward || 150;
-
-                const today = new Date().toISOString().split('T')[0];
-                const done = await db.prepare(
-                    'SELECT * FROM user_tasks WHERE telegram_id = ? AND task_id = ? AND done_date = ?'
-                ).bind(telegramId, 'ad_watch', today).first();
-
-                if (done) {
-                    return errorResponse('TASK_ALREADY_DONE', 'Ad reward already claimed today', 400);
-                }
-
-                if (progress >= 3) {
-                    await db.prepare(
-                        'INSERT INTO user_tasks (telegram_id, task_id, done_date) VALUES (?, ?, ?)'
-                    ).bind(telegramId, 'ad_watch', today).run();
-
-                    const newBalance = await db.prepare(
-                        'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ? RETURNING balance'
-                    ).bind(reward, telegramId).first();
-
-                    await db.prepare(
-                        'INSERT INTO events (telegram_id, event_type, data) VALUES (?, ?, ?)'
-                    ).bind(telegramId, 'ad_reward_claimed', JSON.stringify({ progress, reward })).run();
-
-                    return jsonResponse({
-                        success: true,
-                        claimed: true,
-                        balance: newBalance?.balance || 0,
-                        reward: reward,
-                    });
-                } else {
-                    return errorResponse('NOT_ENOUGH', `Watch ${3 - progress} more ads to claim`, 400);
-                }
-            } catch (e) {
-                console.error('Ad reward error:', e);
-                return errorResponse('SERVER_ERROR', e.message, 500);
-            }
+            return errorResponse('ADS_DISABLED', 'Ad task is coming soon', 400);
         }
 
         // ============================================================
-        // 13. POST /tasks/sync
-        // ============================================================
-        if (path === '/tasks/sync' && method === 'POST') {
-            try {
-                const body = await request.json();
-                const days = body.days || [];
-                if (!Array.isArray(days) || days.length === 0) {
-                    return errorResponse('INVALID_REQUEST', 'Missing days array', 400);
-                }
-
-                let totalReward = 0;
-                const operations = [];
-
-                for (const day of days) {
-                    const date = day.date;
-                    const tasks = day.tasks || [];
-                    if (!date || !Array.isArray(tasks)) continue;
-
-                    for (const taskId of tasks) {
-                        const reward = TASK_REWARDS[taskId];
-                        if (!reward) continue;
-
-                        const existing = await db.prepare(
-                            'SELECT id FROM user_tasks WHERE telegram_id = ? AND task_id = ? AND done_date = ?'
-                        ).bind(telegramId, taskId, date).first();
-
-                        if (!existing) {
-                            operations.push({
-                                sql: 'INSERT INTO user_tasks (telegram_id, task_id, done_date) VALUES (?, ?, ?)',
-                                args: [telegramId, taskId, date]
-                            });
-                            totalReward += reward;
-                        }
-                    }
-                }
-
-                if (operations.length === 0) {
-                    const current = await db.prepare('SELECT balance FROM users WHERE telegram_id = ?').bind(telegramId).first();
-                    return jsonResponse({ success: true, reward: 0, balance: current?.balance || 0 });
-                }
-
-                await db.batch(operations.map(op => db.prepare(op.sql).bind(...op.args)));
-
-                let newBalance = null;
-                if (totalReward > 0) {
-                    const result = await db.prepare(
-                        'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ? RETURNING balance'
-                    ).bind(totalReward, telegramId).first();
-                    newBalance = result?.balance || 0;
-                } else {
-                    const current = await db.prepare('SELECT balance FROM users WHERE telegram_id = ?').bind(telegramId).first();
-                    newBalance = current?.balance || 0;
-                }
-
-                return jsonResponse({
-                    success: true,
-                    reward: totalReward,
-                    balance: newBalance,
-                    inserted: operations.length,
-                });
-            } catch (e) {
-                console.error('Task sync error:', e);
-                return errorResponse('SERVER_ERROR', e.message, 500);
-            }
-        }
-
-        // ============================================================
-        // 14. POST /referral/register
+        // /referral/register
         // ============================================================
         if (path === '/referral/register' && method === 'POST') {
             try {
@@ -1047,92 +1035,57 @@ export default {
                 if (!referrerId || referrerId === telegramId) {
                     return errorResponse('INVALID_REFERRAL', 'Invalid referrer', 400);
                 }
+                const existing = await db.prepare('SELECT * FROM referrals WHERE referred_id = ?').bind(telegramId).first();
+                if (existing) return errorResponse('ALREADY_REFERRED', 'Already referred', 400);
 
-                const existing = await db.prepare(
-                    'SELECT * FROM referrals WHERE referred_id = ?'
-                ).bind(telegramId).first();
-                if (existing) {
-                    return errorResponse('ALREADY_REFERRED', 'Already referred', 400);
-                }
+                const referrer = await db.prepare('SELECT telegram_id FROM users WHERE telegram_id = ?').bind(referrerId).first();
+                if (!referrer) return errorResponse('REFERRER_NOT_FOUND', 'Referrer not found', 404);
 
-                const referrer = await db.prepare('SELECT * FROM users WHERE telegram_id = ?').bind(referrerId).first();
-                if (!referrer) {
-                    return errorResponse('REFERRER_NOT_FOUND', 'Referrer not found', 404);
-                }
+                await db.batch([
+                    db.prepare('INSERT INTO referrals (referrer_id, referred_id) VALUES (?, ?)').bind(referrerId, telegramId),
+                    db.prepare('UPDATE users SET referrals_count = referrals_count + 1, balance = balance + 100 WHERE telegram_id = ?').bind(referrerId),
+                ]);
 
-                await db.prepare(
-                    'INSERT INTO referrals (referrer_id, referred_id) VALUES (?, ?)'
-                ).bind(referrerId, telegramId).run();
-
-                await db.prepare(
-                    'UPDATE users SET referrals_count = referrals_count + 1 WHERE telegram_id = ?'
-                ).bind(referrerId).run();
-
-                await db.prepare(
-                    'UPDATE users SET balance = balance + 100 WHERE telegram_id = ?'
-                ).bind(referrerId).run();
-
-                return jsonResponse({
-                    success: true,
-                    message: 'Referral registered',
-                });
+                return jsonResponse({ success: true });
             } catch (e) {
                 return errorResponse('SERVER_ERROR', e.message, 500);
             }
         }
 
         // ============================================================
-        // 15. POST /referral/claim
+        // /referral/claim (سازگاری)
         // ============================================================
         if (path === '/referral/claim' && method === 'POST') {
             try {
                 const body = await request.json();
                 const task = body.task;
-                if (!task) {
-                    return errorResponse('INVALID_REQUEST', 'Missing task', 400);
-                }
+                const cfg = REFERRAL_REWARDS[task];
+                if (!cfg) return errorResponse('INVALID_TASK', 'Invalid task', 400);
 
-                const rewardMap = {
-                    invite3: { required: 3, reward: 5000 },
-                    invite5: { required: 5, reward: 10000 },
-                    invite10: { required: 10, reward: 30000 },
-                    invite20: { required: 20, reward: 100000 },
-                };
-                const cfg = rewardMap[task];
-                if (!cfg) {
-                    return errorResponse('INVALID_TASK', 'Invalid task', 400);
-                }
-
-                const claimed = await db.prepare(
-                    'SELECT * FROM referral_rewards WHERE telegram_id = ? AND task = ?'
-                ).bind(telegramId, task).first();
-                if (claimed) {
-                    return errorResponse('ALREADY_CLAIMED', 'Reward already claimed', 400);
-                }
+                const claimed = await db.prepare('SELECT * FROM referral_rewards WHERE telegram_id = ? AND task = ?')
+                    .bind(telegramId, task).first();
+                if (claimed) return errorResponse('ALREADY_CLAIMED', 'Already claimed', 400);
 
                 const user = await db.prepare('SELECT referrals_count FROM users WHERE telegram_id = ?').bind(telegramId).first();
-                const count = user?.referrals_count || 0;
+                const count = (user && user.referrals_count) || 0;
                 if (count < cfg.required) {
-                    return errorResponse('NOT_ENOUGH', `Need ${cfg.required - count} more referrals`, 400);
+                    return errorResponse('NOT_ENOUGH', 'Need ' + (cfg.required - count) + ' more', 400);
                 }
 
-                await db.prepare(
-                    'INSERT INTO referral_rewards (telegram_id, task, reward) VALUES (?, ?, ?)'
-                ).bind(telegramId, task, cfg.reward).run();
+                await db.batch([
+                    db.prepare('INSERT OR IGNORE INTO referral_rewards (telegram_id, task, reward) VALUES (?, ?, ?)')
+                        .bind(telegramId, task, cfg.reward),
+                ]);
 
-                const newBalance = await db.prepare(
+                const newBal = await db.prepare(
                     'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ? RETURNING balance'
                 ).bind(cfg.reward, telegramId).first();
-
-                await db.prepare(
-                    'INSERT INTO events (telegram_id, event_type, data) VALUES (?, ?, ?)'
-                ).bind(telegramId, 'referral_claimed', JSON.stringify({ task, reward: cfg.reward })).run();
 
                 return jsonResponse({
                     success: true,
                     reward: cfg.reward,
-                    balance: newBalance?.balance || 0,
-                    referrals: count,
+                    balance: (newBal && newBal.balance) || 0,
+                    referrals: count
                 });
             } catch (e) {
                 return errorResponse('SERVER_ERROR', e.message, 500);
