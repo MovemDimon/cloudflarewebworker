@@ -36,7 +36,7 @@ const REFERRAL_REWARDS = {
     invite20: { required: 20, reward: 100000 },
 };
 
-const USDT_MASTER = 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2E_sFs';
+const USDT_MASTER = 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs';
 const USDT_DECIMALS = 6;
 const CONFIG_CACHE_TTL = 7 * 24 * 60 * 60;  // seconds
 const JWT_EXPIRES = 30 * 24 * 60 * 60;      // 30 روز
@@ -319,7 +319,7 @@ export default {
             JWT_SECRET: env.JWT_SECRET,
             ADMIN_TOKEN: env.ADMIN_TOKEN || '',
             WEBHOOK_SECRET: env.WEBHOOK_SECRET || '',
-            TON_RECIPIENT: env.TON_RECIPIENT || 'UQD-_u6BRI63PvjYQEt9sa0j3lwlCO7DHMkKrH0o9azDL3xP',
+            TON_RECIPIENT: env.TON_RECIPIENT || 'UQBVTscttZ6fcfyHZu2kpDUVbC1QHEDvl-hJhv8YRrLIih7P',
             USDT_JETTON_ADDRESS: env.USDT_JETTON_ADDRESS || USDT_MASTER,
         };
 
