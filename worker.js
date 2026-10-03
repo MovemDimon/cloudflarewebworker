@@ -1,18 +1,12 @@
 // ================================================================
 // DAIMONIUM BACKEND — Cloudflare Worker
-// نسخه V10.0 — Security Hardening + Dual-Network
+// نسخه V10.2 — Mainnet-only + Jetton presets (hardcoded)
 // ================================================================
-// تغییرات نسبت به V9.3:
-//   🔴 WEBHOOK_SECRET اجباری — بدون آن webhook = 503
-//   🔴 رفع race condition در پرداخت Stars (atomic UPDATE RETURNING)
-//   🔴 JWT_SECRET حداقل ۳۲ کاراکتر — startup reject
-//   🔴 Timing-safe comparison برای initData hash
-//   🔴 ولیدیشن دقیق تاریخ در /sync (فقط امروز/دیروز)
-//   🟡 نرمال‌سازی path برای rate limit
-//   🟡 CRC16 verification برای TON addresses
-//   🟡 محدودیت حجم body (64KB)
-//   🟡 Sanitize خطاها در production
-//   🟢 Audit logging برای ولت
+// تغییرات نسبت به V10.1:
+//   🔴 testnet کاملاً حذف شد
+//   🔴 Jetton config از env به hardcoded (بدون نیاز به Cloudflare vars)
+//   🔴 سوییچ NOT ↔ USDT با یک خط (تغییر ACTIVE_JETTON)
+//   🟡 تمام fix های امنیتی حفظ شده
 // ================================================================
 
 const CORS_HEADERS = {
@@ -22,12 +16,41 @@ const CORS_HEADERS = {
     'Access-Control-Max-Age': '86400',
 };
 
+// ================================================================
+// 🎯 ACTIVE JETTON — این خط رو برای سوییچ عوض کن
+// ================================================================
+//   'NOT'  → تست با Notcoin
+//   'USDT' → production با Tether USD
+// ================================================================
+const ACTIVE_JETTON = 'NOT';
+
+const JETTON_PRESETS = {
+    NOT: {
+        master: 'EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT',
+        decimals: 9,
+        symbol: 'NOT',
+    },
+    USDT: {
+        master: 'EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs',
+        decimals: 6,
+        symbol: 'USDT',
+    },
+};
+
+const JETTON = JETTON_PRESETS[ACTIVE_JETTON];
+
+// آدرس گیرنده — این رو با آدرس ولت اصلی خودت عوض کن
+const TON_RECIPIENT = 'UQBVTscttZ6fcfyHZu2kpDUVbC1QHEDvl-hJhv8YRrLIih7P';
+
+// ================================================================
+// PACKAGE DEFINITIONS
+// ================================================================
 const PACKAGE_DEFINITIONS = {
-    package_1: { coins: 10000,    usdt: 1,   stars: 100 },
-    package_2: { coins: 80000,    usdt: 5,   stars: 500 },
-    package_3: { coins: 200000,   usdt: 10,  stars: 1000 },
-    package_4: { coins: 1000000,  usdt: 50,  stars: 5000 },
-    package_5: { coins: 3000000,  usdt: 100, stars: 10000 },
+    package_1: { coins: 10000,    amount: 1,   stars: 100 },
+    package_2: { coins: 80000,    amount: 5,   stars: 500 },
+    package_3: { coins: 200000,   amount: 10,  stars: 1000 },
+    package_4: { coins: 1000000,  amount: 50,  stars: 5000 },
+    package_5: { coins: 3000000,  amount: 100, stars: 10000 },
 };
 
 const TASK_REWARDS = {
@@ -43,24 +66,11 @@ const REFERRAL_REWARDS = {
     invite20: { required: 20, reward: 100000 },
 };
 
-// ✅ V10.0 — آدرس‌های پیش‌فرض هر شبکه
-const DEFAULT_USDT_MASTER = {
-    mainnet: 'UQBVTscttZ6fcfyHZu2kpDUVbC1QHEDvl-hJhv8YRrLIih7P',
-    testnet: '0QCe7M2fePiGus4T4AqPJ8ica3Bzj60RPTPJexM8kP6gD30c',
-};
-
-const DEFAULT_TON_RECIPIENT = {
-    mainnet: 'UQBVTscttZ6fcfyHZu2kpDUVbC1QHEDvl-hJhv8YRrLIih7P',
-    // 👇 TODO: آدرس testnet واقعی خودت را اینجا بگذار
-    testnet: '0QCe7M2fePiGus4T4AqPJ8ica3Bzj60RPTPJexM8kP6gD30c',
-};
-
-const USDT_DECIMALS = 6;
-const CONFIG_CACHE_TTL = 7 * 24 * 60 * 60;  // seconds
-const JWT_EXPIRES = 30 * 24 * 60 * 60;      // 30 روز
-const MAX_BODY_SIZE = 64 * 1024;             // ✅ V10.0: 64KB
-const MIN_JWT_SECRET_LEN = 32;               // ✅ V10.0
-const IS_PRODUCTION = true;                   // ✅ V10.0: sanitize errors
+const CONFIG_CACHE_TTL = 7 * 24 * 60 * 60;
+const JWT_EXPIRES = 30 * 24 * 60 * 60;
+const MAX_BODY_SIZE = 64 * 1024;
+const MIN_JWT_SECRET_LEN = 32;
+const IS_PRODUCTION = true;
 
 // ================================================================
 // HELPERS
@@ -76,38 +86,32 @@ function errorResponse(code, message, status = 400) {
     return jsonResponse({ code, message }, status);
 }
 
-// ✅ V10.0 — sanitize خطا برای production
 function sanitizeError(err, fallbackCode = 'SERVER_ERROR') {
     if (IS_PRODUCTION) {
-        // فقط کد و پیام عمومی
         console.error('[sanitized]', err.message || err);
         return { code: fallbackCode, message: 'Something went wrong. Please try again.' };
     }
     return { code: fallbackCode, message: (err && err.message) || 'Unknown error' };
 }
 
-// ✅ V10.0 — timing-safe comparison
 function timingSafeEqual(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
     if (a.length !== b.length) return false;
     let diff = 0;
-    for (let i = 0; i < a.length; i++) {
-        diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-    }
+    for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
     return diff === 0;
 }
 
-// ✅ V10.0 — نرمال‌سازی path
 function normalizePath(path) {
-    let p = path.split('?')[0];                 // حذف query
-    p = p.replace(/\/{2,}/g, '/');              // // → /
-    p = p.replace(/\/+$/, '');                  // حذف / انتهایی
+    let p = path.split('?')[0];
+    p = p.replace(/\/{2,}/g, '/');
+    p = p.replace(/\/+$/, '');
     if (p === '') p = '/';
     return p.toLowerCase();
 }
 
 // ================================================================
-// TON ADDRESS — CRC16 + Validation
+// TON ADDRESS — CRC16 + Validation (mainnet-only)
 // ================================================================
 function crc16Ton(data) {
     let crc = 0;
@@ -120,17 +124,13 @@ function crc16Ton(data) {
     return crc;
 }
 
-// ✅ V10.0 — ولیدیشن دقیق با CRC
+// ✅ Mainnet-only: فقط EQ و UQ قبول می‌شن
 function verifyTonAddress(address) {
     if (typeof address !== 'string') return false;
     if (address.length !== 48) return false;
-
-    const validPrefixes = ['EQ', 'UQ', 'kQ', '0Q'];
-    if (!validPrefixes.some(p => address.startsWith(p))) return false;
-
+    if (!address.startsWith('EQ') && !address.startsWith('UQ')) return false;
     if (!/^[A-Za-z0-9\-_]+$/.test(address)) return false;
 
-    // decode base64url
     try {
         let clean = address.replace(/-/g, '+').replace(/_/g, '/');
         while (clean.length % 4) clean += '=';
@@ -140,12 +140,10 @@ function verifyTonAddress(address) {
         const bytes = new Uint8Array(36);
         for (let i = 0; i < 36; i++) bytes[i] = raw.charCodeAt(i);
 
-        // tag byte → باید 0x11, 0x51, 0x91, 0xD1 باشه
+        // Mainnet tags: 0x11 (EQ) یا 0x51 (UQ)
         const tag = bytes[0];
-        const validTags = [0x11, 0x51, 0x91, 0xD1];
-        if (!validTags.includes(tag)) return false;
+        if (tag !== 0x11 && tag !== 0x51) return false;
 
-        // CRC
         const expectedCrc = (bytes[34] << 8) | bytes[35];
         const actualCrc = crc16Ton(bytes.slice(0, 34));
         if (expectedCrc !== actualCrc) return false;
@@ -156,25 +154,8 @@ function verifyTonAddress(address) {
     }
 }
 
-// نگه‌داشتن برای backward-compat
 function isValidTonAddress(address) {
     return verifyTonAddress(address);
-}
-
-// ✅ V10.0 — تشخیص شبکه از tag byte
-function detectAddressNetwork(addr) {
-    if (!addr || typeof addr !== 'string') return null;
-    if (addr.startsWith('EQ') || addr.startsWith('UQ')) return 'mainnet';
-    if (addr.startsWith('kQ') || addr.startsWith('0Q')) return 'testnet';
-    return null;
-}
-
-function normalizeNetwork(n) {
-    if (!n) return null;
-    const s = String(n).toLowerCase();
-    if (s === 'testnet' || s === 'test') return 'testnet';
-    if (s === 'mainnet' || s === 'main') return 'mainnet';
-    return null;
 }
 
 function tonAddressHash(addr) {
@@ -251,7 +232,7 @@ async function verifyJWT(token, secret) {
 }
 
 // ================================================================
-// TELEGRAM INITDATA — timing-safe verify
+// TELEGRAM INITDATA
 // ================================================================
 async function verifyTelegramInitData(initData, botToken) {
     try {
@@ -276,10 +257,8 @@ async function verifyTelegramInitData(initData, botToken) {
         const calculatedHex = Array.from(new Uint8Array(calculatedHash))
             .map(b => b.toString(16).padStart(2, '0')).join('');
 
-        // ✅ V10.0 — timing-safe
         if (!timingSafeEqual(calculatedHex, hash)) return null;
 
-        // ✅ V10.0 — چک سن initData (حداکثر ۲۴ ساعت)
         const authDate = parseInt(params.get('auth_date') || '0');
         if (authDate > 0 && (Math.floor(Date.now() / 1000) - authDate) > 86400) {
             console.warn('[auth] initData expired');
@@ -298,20 +277,30 @@ async function verifyTelegramInitData(initData, botToken) {
 // ================================================================
 // TON JETTON TRANSFER VERIFICATION
 // ================================================================
-async function findMatchingJettonTransfer(senderWallet, expectedAmountUsdt, ourAddress, usdtMaster, network, apiKey) {
+async function findMatchingJettonTransfer(
+    senderWallet,
+    expectedAmount,
+    ourAddress,
+    jettonMaster,
+    decimals,
+    apiKey
+) {
     try {
-        const apiBase = (network === 'testnet') ? 'https://testnet.tonapi.io' : 'https://tonapi.io';
-        const url = apiBase + '/v2/accounts/' + encodeURIComponent(senderWallet) + '/events?limit=20';
+        const url = 'https://tonapi.io/v2/accounts/'
+                  + encodeURIComponent(senderWallet) + '/events?limit=20';
         const res = await fetch(url, {
             headers: apiKey ? { 'Authorization': 'Bearer ' + apiKey } : {}
         });
         if (!res.ok) return { error: 'TON API returned ' + res.status };
         const data = await res.json();
 
-        const expectedRawAmount = Math.round(expectedAmountUsdt * Math.pow(10, USDT_DECIMALS));
+        const expectedRawAmount = Math.round(expectedAmount * Math.pow(10, decimals));
         const ourHash = tonAddressHash(ourAddress);
-        const usdtHash = tonAddressHash(usdtMaster);
+        const jettonHash = tonAddressHash(jettonMaster);
         const now = Math.floor(Date.now() / 1000);
+
+        console.log('🔍 [ton-verify] amount=' + expectedAmount
+                  + ' (raw=' + expectedRawAmount + ', decimals=' + decimals + ')');
 
         for (const ev of data.events || []) {
             if (ev.timestamp && (now - ev.timestamp) > 600) continue;
@@ -319,15 +308,14 @@ async function findMatchingJettonTransfer(senderWallet, expectedAmountUsdt, ourA
                 if (act.type !== 'JettonTransfer') continue;
                 const jt = act.JettonTransfer;
                 if (!jt) continue;
-                if (tonAddressHash(jt.jetton && jt.jetton.address) !== usdtHash) continue;
+                if (tonAddressHash(jt.jetton && jt.jetton.address) !== jettonHash) continue;
                 if (tonAddressHash(jt.recipient && jt.recipient.address) !== ourHash) continue;
                 if (parseInt(jt.amount, 10) !== expectedRawAmount) continue;
                 return {
                     txHash: ev.event_id || ev.lt,
                     sender: (jt.sender && jt.sender.address) || senderWallet,
-                    amount: expectedAmountUsdt,
+                    amount: expectedAmount,
                     rawAmount: expectedRawAmount,
-                    network,
                 };
             }
         }
@@ -370,17 +358,13 @@ async function getUserFromJWT(request, secret) {
 }
 
 // ================================================================
-// BODY READER — با limit
+// BODY READER
 // ================================================================
 async function readJsonBody(request) {
     const contentLength = parseInt(request.headers.get('Content-Length') || '0', 10);
-    if (contentLength > MAX_BODY_SIZE) {
-        throw new Error('BODY_TOO_LARGE');
-    }
+    if (contentLength > MAX_BODY_SIZE) throw new Error('BODY_TOO_LARGE');
     const text = await request.text();
-    if (text.length > MAX_BODY_SIZE) {
-        throw new Error('BODY_TOO_LARGE');
-    }
+    if (text.length > MAX_BODY_SIZE) throw new Error('BODY_TOO_LARGE');
     try {
         return text ? JSON.parse(text) : {};
     } catch (e) {
@@ -392,7 +376,7 @@ async function readJsonBody(request) {
 // CONFIG LOADER
 // ================================================================
 async function loadConfig(kv, db, cache, ctx) {
-    const CACHE_KEY = 'https://daimonium.internal/config-v10';
+    const CACHE_KEY = 'https://daimonium.internal/config-v12';
     const cached = await cache.match(CACHE_KEY);
     if (cached) {
         try { return await cached.json(); } catch (e) {}
@@ -459,7 +443,7 @@ export default {
         if (method === 'OPTIONS') return new Response(null, { headers: CORS_HEADERS });
 
         // ============================================================
-        // CONFIG — با ولیدیشن امنیتی
+        // CONFIG
         // ============================================================
         const config = {
             TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN,
@@ -467,21 +451,11 @@ export default {
             JWT_SECRET: env.JWT_SECRET || '',
             ADMIN_TOKEN: env.ADMIN_TOKEN || '',
             WEBHOOK_SECRET: env.WEBHOOK_SECRET || '',
-
-            USDT_MASTER: {
-                mainnet: env.USDT_JETTON_ADDRESS_MAINNET || env.USDT_JETTON_ADDRESS || DEFAULT_USDT_MASTER.mainnet,
-                testnet: env.USDT_JETTON_ADDRESS_TESTNET || DEFAULT_USDT_MASTER.testnet,
-            },
-
-            TON_RECIPIENT: {
-                mainnet: env.TON_RECIPIENT_MAINNET || env.TON_RECIPIENT || DEFAULT_TON_RECIPIENT.mainnet,
-                testnet: env.TON_RECIPIENT_TESTNET || DEFAULT_TON_RECIPIENT.testnet,
-            },
         };
 
-        // ✅ V10.0 — ولیدیشن سخت‌گیرانه‌ی startup
+        // ولیدیشن startup
         if (!config.JWT_SECRET || config.JWT_SECRET.length < MIN_JWT_SECRET_LEN) {
-            console.error('🚨 JWT_SECRET missing or too weak (need >= ' + MIN_JWT_SECRET_LEN + ' chars)');
+            console.error('🚨 JWT_SECRET missing or too weak');
             return errorResponse('SERVER_ERROR', 'Server not properly configured', 500);
         }
         if (!config.TELEGRAM_BOT_TOKEN) {
@@ -494,12 +468,11 @@ export default {
         const cache = caches.default;
 
         // ============================================================
-        // WEBHOOK — ✅ V10.0: SECRET اجباری
+        // WEBHOOK
         // ============================================================
         if (path === '/webhook' && method === 'POST') {
-            // 🔴 اگر secret تنظیم نشده، webhook کاملاً غیرفعال
             if (!config.WEBHOOK_SECRET) {
-                console.error('🚨 WEBHOOK_SECRET not set — webhook is DISABLED for security');
+                console.error('🚨 WEBHOOK_SECRET not set');
                 return new Response('Webhook not configured', { status: 503 });
             }
 
@@ -517,7 +490,6 @@ export default {
             }
 
             try {
-                // /start
                 if (body.message && body.message.text === '/start') {
                     const chatId = body.message.chat.id;
                     const firstName = body.message.from.first_name || 'User';
@@ -526,7 +498,6 @@ export default {
                     );
                 }
 
-                // successful_payment — ✅ V10.0: ATOMIC
                 if (body.message && body.message.successful_payment) {
                     const payment = body.message.successful_payment;
                     const payload = payment.invoice_payload;
@@ -536,8 +507,6 @@ export default {
                         return new Response('OK', { headers: CORS_HEADERS });
                     }
 
-                    // ✅ V10.0: فقط اگر status='pending' باشه به paid تغییر می‌کنه
-                    //    اگه یک webhook دیگه هم‌زمان رسید، RETURNING خالی برمی‌گردونه
                     const claimed = await db.prepare(
                         `UPDATE payments 
                          SET status = 'paid', updated_at = CURRENT_TIMESTAMP 
@@ -562,9 +531,9 @@ export default {
                             }
                         ));
 
-                        console.log('✅ [webhook] Payment credited: ' + claimed.coins + ' to ' + telegramId);
+                        console.log('✅ [webhook] Payment credited: ' + claimed.coins);
                     } else {
-                        console.log('ℹ️ [webhook] Duplicate/already-processed payment ignored');
+                        console.log('ℹ️ [webhook] Duplicate payment ignored');
                     }
                 }
 
@@ -600,11 +569,18 @@ export default {
         // HEALTH
         // ============================================================
         if (path === '/health' || path === '/') {
-            return new Response('✅ Daimonium V10.0 running', { headers: CORS_HEADERS });
+            return new Response(
+                '✅ Daimonium V10.2 running\n' +
+                'Network: mainnet only\n' +
+                'Active Jetton: ' + JETTON.symbol + ' (' + JETTON.decimals + ' decimals)\n' +
+                'Jetton Master: ' + JETTON.master + '\n' +
+                'Recipient: ' + TON_RECIPIENT,
+                { headers: CORS_HEADERS }
+            );
         }
 
         // ============================================================
-        // RATE LIMIT — ✅ V10.0: با path نرمال‌شده
+        // RATE LIMIT
         // ============================================================
         if (path !== '/webhook') {
             const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
@@ -615,7 +591,7 @@ export default {
             else if (path.startsWith('/payments/')) limit = 30;
             else if (path === '/sync') limit = 60;
             else if (path === '/ton/jetton-wallet') limit = 30;
-            else if (path === '/wallet/connect') limit = 10;   // ✅ V10.0: سخت‌گیرانه
+            else if (path === '/wallet/connect') limit = 10;
 
             const allowed = await checkRateLimit(kv, limitKey, limit, 60);
             if (!allowed) return errorResponse('RATE_LIMITED', 'Too many requests', 429);
@@ -627,25 +603,21 @@ export default {
         if (path === '/ton/jetton-wallet' && method === 'GET') {
             try {
                 const owner = url.searchParams.get('owner');
-                const chainParam = normalizeNetwork(url.searchParams.get('chain')) || 'mainnet';
-                const isTestnet = chainParam === 'testnet';
+                // ✅ master از کلاینت پذیرفته می‌شه ولی فقط اگه معتبر باشه
+                //    در غیر این صورت از ACTIVE_JETTON استفاده می‌کنیم
+                const clientMaster = url.searchParams.get('master');
+                const master = (clientMaster && /^[EUk0]Q[A-Za-z0-9\-_]{46}$/.test(clientMaster))
+                             ? clientMaster
+                             : JETTON.master;
 
-                const master = url.searchParams.get('master') || config.USDT_MASTER[chainParam];
-
-                if (!owner || !master) {
-                    return errorResponse('INVALID_REQUEST', 'Missing owner or master', 400);
+                if (!owner) {
+                    return errorResponse('INVALID_REQUEST', 'Missing owner', 400);
                 }
                 if (!verifyTonAddress(owner)) {
                     return errorResponse('INVALID_WALLET', 'Invalid TON address', 400);
                 }
 
-                const detected = detectAddressNetwork(owner);
-                if (detected && detected !== chainParam) {
-                    console.warn('[jetton] chain mismatch: param=' + chainParam + ' detected=' + detected);
-                }
-
-                const apiBase = isTestnet ? 'https://testnet.tonapi.io' : 'https://tonapi.io';
-                const apiUrl = apiBase + '/v2/accounts/'
+                const apiUrl = 'https://tonapi.io/v2/accounts/'
                              + encodeURIComponent(owner) + '/jettons/'
                              + encodeURIComponent(master);
 
@@ -657,7 +629,7 @@ export default {
                 if (!res.ok) {
                     return jsonResponse({
                         wallet_address: null,
-                        chain: chainParam,
+                        symbol: JETTON.symbol,
                         error: 'tonapi returned ' + res.status
                     });
                 }
@@ -666,7 +638,8 @@ export default {
                     wallet_address: (data.wallet_address && data.wallet_address.address) || null,
                     balance: data.balance || '0',
                     jetton: data.jetton || null,
-                    chain: chainParam,
+                    symbol: JETTON.symbol,
+                    decimals: JETTON.decimals,
                 });
             } catch (e) {
                 console.error('Jetton wallet lookup error:', e);
@@ -876,7 +849,7 @@ export default {
         }
 
         // ============================================================
-        // /sync — ✅ V10.0: date validation
+        // /sync
         // ============================================================
         if (path === '/sync' && method === 'POST') {
             try {
@@ -900,7 +873,6 @@ export default {
                 }
                 if (events.length > 50) return errorResponse('TOO_MANY_EVENTS', 'Max 50 events per sync', 400);
 
-                // ✅ V10.0 — محاسبه‌ی تاریخ‌های مجاز
                 const now = new Date();
                 const todayUtc = now.toISOString().split('T')[0];
                 const yesterdayUtc = new Date(now.getTime() - 86400000).toISOString().split('T')[0];
@@ -920,8 +892,6 @@ export default {
                         const reward = TASK_REWARDS[taskId];
                         if (!reward || !date) continue;
                         if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
-
-                        // ✅ V10.0 — فقط امروز/دیروز
                         if (!allowedDates.has(date)) {
                             console.warn('[sync] rejected old date: ' + date);
                             continue;
@@ -1023,7 +993,7 @@ export default {
         }
 
         // ============================================================
-        // /wallet/connect — ✅ V10.0: strict + audit
+        // /wallet/connect
         // ============================================================
         if (path === '/wallet/connect' && method === 'POST') {
             try {
@@ -1035,8 +1005,7 @@ export default {
                 if (!walletAddress) return errorResponse('INVALID_REQUEST', 'Missing walletAddress', 400);
                 if (!verifyTonAddress(walletAddress)) return errorResponse('INVALID_WALLET', 'Invalid TON address', 400);
 
-                const network = detectAddressNetwork(walletAddress);
-                console.log('🔗 [wallet/connect] user=' + telegramId + ' network=' + network + ' addr=' + walletAddress.substring(0, 10) + '...');
+                console.log('🔗 [wallet/connect] user=' + telegramId + ' addr=' + walletAddress.substring(0, 10) + '...');
 
                 const existing = await db.prepare(
                     'SELECT id FROM wallets WHERE telegram_id = ? AND wallet_address = ?'
@@ -1050,21 +1019,19 @@ export default {
                         .bind(telegramId, walletAddress).run();
                 }
 
-                // ✅ V10.0 — audit log
                 ctx.waitUntil((async () => {
                     try {
                         await db.prepare(
                             'INSERT INTO events (telegram_id, event_type, data) VALUES (?, ?, ?)'
                         ).bind(telegramId, 'wallet_connected', JSON.stringify({
                             wallet: walletAddress,
-                            network,
                             ts: Date.now(),
                             ip: request.headers.get('CF-Connecting-IP') || 'unknown'
                         })).run();
                     } catch (e) { /* silent */ }
                 })());
 
-                return jsonResponse({ success: true, walletAddress, network });
+                return jsonResponse({ success: true, walletAddress });
             } catch (e) {
                 const err = sanitizeError(e, 'WALLET_ERROR');
                 return errorResponse(err.code, err.message, 500);
@@ -1110,41 +1077,27 @@ export default {
                 const pkg = packageData[packageId];
                 if (!pkg) return errorResponse('INVALID_PACKAGE', 'Invalid package', 400);
 
+                // ✅ مقدار پرداخت — هم از usdt قبلی، هم از amount جدید
+                const expectedAmount = pkg.amount !== undefined ? pkg.amount : pkg.usdt;
+                if (expectedAmount === undefined) {
+                    return errorResponse('SERVER_ERROR', 'Package amount missing', 500);
+                }
+
                 const wallet = await db.prepare(
                     'SELECT wallet_address FROM wallets WHERE telegram_id = ? AND is_active = 1 ORDER BY created_at DESC LIMIT 1'
                 ).bind(telegramId).first();
                 if (!wallet) return errorResponse('WALLET_NOT_CONNECTED', 'Connect wallet first', 400);
 
-                const detectedNetwork = detectAddressNetwork(wallet.wallet_address);
-                const clientNetwork = normalizeNetwork(body.network);
-                const network = detectedNetwork || clientNetwork || 'mainnet';
-
                 console.log('🔎 [ton/verify] user=' + telegramId
-                          + ' detected=' + detectedNetwork
-                          + ' client=' + clientNetwork
-                          + ' final=' + network);
-
-                if (clientNetwork && detectedNetwork && clientNetwork !== detectedNetwork) {
-                    return errorResponse(
-                        'NETWORK_MISMATCH',
-                        'Wallet is on ' + detectedNetwork + ' but request says ' + clientNetwork,
-                        400
-                    );
-                }
-
-                const expectedRecipient = config.TON_RECIPIENT[network];
-                const usdtMaster = config.USDT_MASTER[network];
-
-                if (!expectedRecipient || !usdtMaster) {
-                    return errorResponse('SERVER_ERROR', 'Missing config for network', 500);
-                }
+                          + ' pkg=' + packageId
+                          + ' amount=' + expectedAmount + ' ' + JETTON.symbol);
 
                 const match = await findMatchingJettonTransfer(
                     wallet.wallet_address,
-                    pkg.usdt,
-                    expectedRecipient,
-                    usdtMaster,
-                    network,
+                    expectedAmount,
+                    TON_RECIPIENT,
+                    JETTON.master,
+                    JETTON.decimals,
                     config.TON_API_KEY
                 );
 
@@ -1153,16 +1106,14 @@ export default {
                         verified: false,
                         pending: true,
                         message: 'Waiting for blockchain confirmation...',
-                        network,
+                        jetton: JETTON.symbol,
                     });
                 }
 
-                // ✅ V10.0 — atomic claim
                 const existing = await db.prepare('SELECT * FROM processed_transactions WHERE tx_hash = ?')
                     .bind(match.txHash).first();
                 if (existing) return errorResponse('PAYMENT_REPLAY', 'Already processed', 400);
 
-                // چک second-time برای race condition
                 const insertTx = await db.prepare(
                     'INSERT OR IGNORE INTO processed_transactions (tx_hash, telegram_id) VALUES (?, ?) RETURNING id'
                 ).bind(match.txHash, telegramId).first();
@@ -1173,18 +1124,20 @@ export default {
 
                 await db.prepare(
                     'INSERT INTO payments (telegram_id, type, package_id, amount, coins, tx_hash, status) VALUES (?, ?, ?, ?, ?, ?, ?)'
-                ).bind(telegramId, 'ton', packageId, pkg.usdt, pkg.coins, match.txHash, 'paid').run();
+                ).bind(telegramId, 'ton', packageId, expectedAmount, pkg.coins, match.txHash, 'paid').run();
 
                 const newBal = await db.prepare(
                     'UPDATE users SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE telegram_id = ? RETURNING balance'
                 ).bind(pkg.coins, telegramId).first();
+
+                console.log('✅ [ton/verify] Payment verified: ' + pkg.coins + ' coins');
 
                 return jsonResponse({
                     verified: true,
                     coins: pkg.coins,
                     balance: (newBal && newBal.balance) || 0,
                     txHash: match.txHash,
-                    network,
+                    jetton: JETTON.symbol,
                 });
             } catch (e) {
                 const err = sanitizeError(e, 'PAYMENT_ERROR');
@@ -1210,7 +1163,6 @@ export default {
                 if (!pkg) return errorResponse('INVALID_PACKAGE', 'Invalid package', 400);
 
                 const amount = pkg.stars;
-                // ✅ V10.0 — payload با nonce تصادفی
                 const rand = crypto.randomUUID().replace(/-/g, '').substring(0, 16);
                 const invoicePayload = 'stars_' + Date.now() + '_' + telegramId + '_' + rand;
 
