@@ -22,7 +22,7 @@ const CORS_HEADERS = {
 //   'NOT'  → تست با Notcoin
 //   'USDT' → production با Tether USD
 // ================================================================
-const ACTIVE_JETTON = 'NOT';
+const ACTIVE_JETTON = 'USDT';
 
 const JETTON_PRESETS = {
     NOT: {
